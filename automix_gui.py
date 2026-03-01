@@ -693,10 +693,14 @@ class TimelineCanvas(tk.Canvas):
                 bot_pts += [px, mid + amp]
 
             if len(top_pts) >= 4:
-                all_pts = top_pts + list(reversed(bot_pts))
-                self.create_polygon(all_pts, fill=WAVE_FILL, outline='')
-                self.create_line(top_pts, fill=WAVE_LINE, width=1)
-                self.create_line(bot_pts, fill=WAVE_LINE, width=1)
+                # Reverse bot_pts as (x,y) pairs so the polygon closes correctly
+                bot_rev = []
+                for j in range(len(bot_pts) - 2, -1, -2):
+                    bot_rev += [bot_pts[j], bot_pts[j + 1]]
+                all_pts = top_pts + bot_rev
+                self.create_polygon(*all_pts, fill=WAVE_FILL, outline='')
+                self.create_line(*top_pts, fill=WAVE_LINE, width=1)
+                self.create_line(*bot_pts, fill=WAVE_LINE, width=1)
 
         # Trim handles
         if cx0 >= 0:
