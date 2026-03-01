@@ -1,854 +1,1482 @@
+#!/usr/bin/env python3
+"""
+DJ AutoMix  –  Complete Rewrite
+
+Dependencies:
+    pip install numpy soundfile sounddevice tkinterdnd2
+
+Optional (recommended):
+    pip install librosa          # BPM + key detection
+    ffmpeg in PATH              # MP3 / M4A / AAC import & MP3 export
+
+Features:
+  • Drag & drop audio files onto the timeline or track list
+  • Zoomable, scrollable waveform timeline (Ctrl+Wheel or +/- keys)
+  • Draggable crossfade markers between tracks
+  • Click timeline to set playhead; drag playhead to seek
+  • Double-click track to split; right-click for trim / split / remove
+  • Smart auto-transitions based on tail/head energy analysis
+  • Per-transition sliders in the sidebar
+  • Sounddevice-based playback (sample-accurate, no ffplay needed)
+  • BPM & key detection via librosa (runs in background)
+  • Export to WAV or MP3 (MP3 needs ffmpeg)
+  • Keyboard: Space = play/stop  |  +/- = zoom  |  ←/→ = seek 5s
+"""
+
+# ── stdlib ───────────────────────────────────────────────────────────────────
 import os
 import sys
-import shlex
-import math
+import threading
 import time
 import tempfile
 import subprocess
-import threading
-from dataclasses import dataclass
+import shlex
+import math
+from dataclasses import dataclass, field
 from pathlib import Path
 
+# ── GUI ──────────────────────────────────────────────────────────────────────
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
-# Optional drag & drop support
 try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore
+    from tkinterdnd2 import DND_FILES, TkinterDnD
     DND_OK = True
-except Exception:
+except ImportError:
     TkinterDnD = None
     DND_FILES = None
     DND_OK = False
 
+# ── Audio ────────────────────────────────────────────────────────────────────
 import numpy as np
+import soundfile as sf
+import sounddevice as sd
 
-AUDIO_EXTS = (".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac", ".aiff", ".aif")
+try:
+    import librosa
+    LIBROSA_OK = True
+except ImportError:
+    librosa = None
+    LIBROSA_OK = False
+
+# ─────────────────────────────────────────────────────────────────────────────
+AUDIO_EXTS = {'.wav', '.flac', '.ogg', '.aiff', '.aif', '.mp3', '.m4a', '.aac'}
+
+# Timeline layout constants
+RULER_H   = 28      # height of time ruler (pixels)
+TRACK_H   = 90      # height of each track row (pixels)
+MIN_PPS   = 8.0     # min pixels-per-second (zoomed out)
+MAX_PPS   = 600.0   # max pixels-per-second (zoomed in)
+XFADE_HIT = 12      # pixel radius for crossfade marker hit-test
+
+# Color palette
+BG        = '#101214'
+RULER_BG  = '#0c0e10'
+TRACK_BG  = '#141c28'
+TRACK_BOR = '#2a3545'
+WAVE_FILL = '#1c4a7a'
+WAVE_LINE = '#3aa7ff'
+XFADE_COL = '#ffb020'
+XFADE_BG  = '#2a1500'
+PH_COL    = '#ff4d4d'
+TEXT_COL  = '#c8d8e8'
+DIM_COL   = '#4a5565'
+GRID_COL  = '#1e2530'
+SEL_COL   = '#243050'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
 
-def quote_cmd(cmd):
-    return " ".join(shlex.quote(str(x)) for x in cmd)
+def fmt_time(sec: float) -> str:
+    sec = max(0.0, sec)
+    m = int(sec) // 60
+    return f"{m}:{sec - m * 60:05.2f}"
 
 
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
-
-
-def parse_dnd_files(data: str):
-    # tkinterdnd2 returns a string that may contain braces for paths with spaces
-    # Example: "{C:/My Files/a.mp3} {C:/b.wav}"
-    out = []
-    cur = ""
-    in_brace = False
-    for ch in data:
-        if ch == "{":
-            in_brace = True
-            cur = ""
-        elif ch == "}":
-            in_brace = False
+def parse_dnd(data: str) -> list:
+    """Parse tkinterdnd2 drop data into file paths."""
+    out, cur, brace = [], '', False
+    for c in data:
+        if c == '{':
+            brace = True; cur = ''
+        elif c == '}':
+            brace = False
             if cur:
                 out.append(cur)
-            cur = ""
-        elif ch.isspace() and not in_brace:
+            cur = ''
+        elif c.isspace() and not brace:
             if cur:
                 out.append(cur)
-                cur = ""
+            cur = ''
         else:
-            cur += ch
+            cur += c
     if cur:
         out.append(cur)
     return out
 
 
+def load_audio(path: str, ffmpeg: str = 'ffmpeg') -> tuple:
+    """
+    Load audio file → (float32 ndarray shape (N, 2), sample_rate).
+    Uses soundfile for WAV/FLAC/OGG/AIFF; falls back to ffmpeg for MP3/M4A/AAC.
+    """
+    ext = Path(path).suffix.lower()
+    if ext not in {'.mp3', '.m4a', '.aac'}:
+        try:
+            data, sr = sf.read(path, always_2d=True)
+            arr = data.astype(np.float32)
+            if arr.shape[1] == 1:
+                arr = np.repeat(arr, 2, axis=1)
+            return arr, sr
+        except Exception:
+            pass
+
+    # Fallback: ffmpeg → raw interleaved float32 stereo
+    cmd = [
+        ffmpeg, '-hide_banner', '-loglevel', 'error',
+        '-i', path, '-vn', '-ac', '2', '-ar', '44100',
+        '-f', 'f32le', 'pipe:1',
+    ]
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=120)
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"Cannot load '{Path(path).name}'.\n"
+            "soundfile could not read it and ffmpeg was not found.\n"
+            "Install ffmpeg and add it to PATH, or use WAV/FLAC/OGG files."
+        )
+    if p.returncode != 0 or not p.stdout:
+        raise RuntimeError(
+            f"ffmpeg failed to decode '{Path(path).name}':\n"
+            f"{p.stderr.decode(errors='replace')[:300]}"
+        )
+    arr = np.frombuffer(p.stdout, dtype=np.float32).reshape(-1, 2)
+    return arr.copy(), 44100
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Track
+# ─────────────────────────────────────────────────────────────────────────────
+
 @dataclass
 class Track:
     path: str
-    duration: float = 0.0  # seconds
+    data: np.ndarray = field(default=None, repr=False)
     sr: int = 44100
     channels: int = 2
-    waveform: np.ndarray | None = None  # downsampled abs waveform for display
+    duration: float = 0.0          # full file duration
+    trim_start: float = 0.0        # trim in-point (seconds into raw audio)
+    trim_end: float = 0.0          # trim out-point
+    waveform: np.ndarray = field(default=None, repr=False)  # normalized RMS envelope
+    bpm: float = None
+    key: str = None
+
+    # ── loading ──────────────────────────────────────────────────────────────
+
+    def load(self, ffmpeg: str = 'ffmpeg'):
+        self.data, self.sr = load_audio(self.path, ffmpeg)
+        self.channels = self.data.shape[1]
+        self.duration = self.data.shape[0] / self.sr
+        self.trim_start = 0.0
+        self.trim_end = self.duration
+        self._compute_waveform()
+
+    # ── segment helpers ──────────────────────────────────────────────────────
+
+    @property
+    def seg_dur(self) -> float:
+        return max(0.0, self.trim_end - self.trim_start)
+
+    def get_segment(self) -> np.ndarray:
+        s = int(self.trim_start * self.sr)
+        e = int(self.trim_end * self.sr)
+        return self.data[s:e]
+
+    # ── waveform envelope ─────────────────────────────────────────────────────
+
+    def _compute_waveform(self, resolution: int = 2000):
+        seg = self.get_segment()
+        if seg.size < 4:
+            self.waveform = None
+            return
+        mono = np.mean(seg, axis=1)
+        hop = max(1, mono.size // resolution)
+        n = mono.size // hop
+        blocks = mono[: n * hop].reshape(n, hop)
+        env = np.sqrt(np.mean(blocks ** 2, axis=1))
+        mx = env.max()
+        if mx > 1e-9:
+            env /= mx
+        self.waveform = env.astype(np.float32)
+
+    # ── editing ───────────────────────────────────────────────────────────────
+
+    def split(self, at_seg_sec: float):
+        """Split at `at_seg_sec` seconds from trim_start. Returns (left, right) or None."""
+        abs_t = self.trim_start + clamp(at_seg_sec, 0.001, self.seg_dur - 0.001)
+        if abs_t <= self.trim_start or abs_t >= self.trim_end:
+            return None
+        left = Track(
+            path=self.path, data=self.data, sr=self.sr, channels=self.channels,
+            duration=self.duration, trim_start=self.trim_start, trim_end=abs_t,
+        )
+        right = Track(
+            path=self.path, data=self.data, sr=self.sr, channels=self.channels,
+            duration=self.duration, trim_start=abs_t, trim_end=self.trim_end,
+        )
+        left._compute_waveform()
+        right._compute_waveform()
+        return left, right
+
+    # ── analysis (librosa) ────────────────────────────────────────────────────
+
+    def analyze(self):
+        if not LIBROSA_OK:
+            return
+        try:
+            y = np.mean(self.data, axis=1).astype(np.float32)
+            tempo, _ = librosa.beat.beat_track(y=y, sr=self.sr)
+            self.bpm = float(np.atleast_1d(tempo)[0])
+            chroma = librosa.feature.chroma_cqt(y=y, sr=self.sr)
+            keys = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+            self.key = keys[int(np.argmax(np.mean(chroma, axis=1)))]
+        except Exception:
+            pass
 
 
-class FFPlayer:
-    """Simple playback using ffplay subprocess (robust across OS)."""
+# ─────────────────────────────────────────────────────────────────────────────
+# Audio Engine
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AudioEngine:
+    """
+    Sounddevice-based playback engine.
+    Thread-safe: play/stop from any thread.
+    """
 
     def __init__(self):
-        self.proc: subprocess.Popen | None = None
+        self._stream: sd.OutputStream = None
+        self._data: np.ndarray = None
+        self._sr: int = 44100
+        self._pos: int = 0
+        self._stopping: bool = False
+        self.volume: float = 1.0
+        self.finished_cb = None          # called from audio thread when playback ends
+
+    @property
+    def position(self) -> float:
+        return self._pos / self._sr if self._sr else 0.0
+
+    @property
+    def is_playing(self) -> bool:
+        return self._stream is not None and self._stream.active and not self._stopping
+
+    def play(self, arr: np.ndarray, sr: int, start_sec: float = 0.0):
+        self.stop()
+        if arr.ndim == 1:
+            arr = arr[:, np.newaxis]
+        if arr.shape[1] == 1:
+            arr = np.repeat(arr, 2, axis=1)
+        self._data = arr.astype(np.float32)
+        self._sr = sr
+        self._pos = int(clamp(start_sec * sr, 0, arr.shape[0] - 1))
+        self._stopping = False
+
+        def _cb(outdata, frames, _time, _status):
+            if self._stopping:
+                outdata[:] = 0
+                raise sd.CallbackStop()
+            chunk = self._data[self._pos: self._pos + frames]
+            vol = self.volume
+            n = chunk.shape[0]
+            if n < frames:
+                if n:
+                    outdata[:n] = chunk * vol
+                outdata[n:] = 0
+                raise sd.CallbackStop()
+            else:
+                outdata[:] = chunk * vol
+            self._pos += frames
+
+        def _done():
+            if self.finished_cb:
+                self.finished_cb()
+
+        self._stream = sd.OutputStream(
+            samplerate=sr, channels=2, dtype='float32',
+            callback=_cb, finished_callback=_done,
+        )
+        self._stream.start()
 
     def stop(self):
-        if self.proc and self.proc.poll() is None:
+        self._stopping = True
+        if self._stream:
             try:
-                self.proc.terminate()
+                self._stream.stop()
             except Exception:
                 pass
-        self.proc = None
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        self._stopping = False
 
-    def play_file(self, ffplay_path: str, path: str, start_sec: float = 0.0):
-        self.stop()
-        cmd = [ffplay_path, "-nodisp", "-autoexit", "-hide_banner", "-loglevel", "error"]
-        if start_sec > 0:
-            cmd += ["-ss", f"{start_sec:.3f}"]
-        cmd += [path]
-        self.proc = subprocess.Popen(cmd)
-
-    def play_wav_bytes(self, ffplay_path: str, wav_path: str):
-        self.play_file(ffplay_path, wav_path, 0.0)
+    def seek(self, sec: float):
+        if self._data is not None:
+            self._pos = int(clamp(sec * self._sr, 0, self._data.shape[0] - 1))
 
 
-class WaveformCanvas(tk.Canvas):
-    """Very lightweight waveform/timeline view."""
-    def __init__(self, parent, **kwargs):
-        super().__init__(parent, bg="#101214", highlightthickness=0, **kwargs)
-        self.tracks: list[Track] = []
-        self.transitions: list[float] = []  # crossfade seconds per boundary (len = len(tracks)-1)
-        self.total_duration = 0.0
-        self.pixels_per_sec = 80.0  # zoom factor
-        self.playhead_sec = 0.0
+# ─────────────────────────────────────────────────────────────────────────────
+# Timeline Canvas
+# ─────────────────────────────────────────────────────────────────────────────
 
-        self.bind("<MouseWheel>", self._on_wheel_zoom)  # Windows/mac
-        self.bind("<Button-4>", lambda e: self._zoom(1.1))  # Linux up
-        self.bind("<Button-5>", lambda e: self._zoom(0.9))  # Linux down
+class TimelineCanvas(tk.Canvas):
+    """
+    Multi-track waveform timeline.
 
-    def set_data(self, tracks: list[Track], transitions: list[float]):
+    Interactions
+    ─────────────
+    Left-click          → set playhead
+    Drag playhead       → seek
+    Drag orange marker  → adjust crossfade duration
+    Double-click        → split track at cursor
+    Right-click         → context menu (split / trim / remove)
+    Ctrl + Scroll       → zoom (centered on cursor)
+    Scroll              → horizontal pan
+    +/-  keys           → zoom in / out
+    """
+
+    def __init__(self, parent, app, hscroll, **kw):
+        super().__init__(parent, bg=BG, highlightthickness=0, **kw)
+        self.app = app
+        self.hscroll = hscroll
+
+        self.tracks: list = []
+        self.transitions: list = []
+        self.pps: float = 80.0       # pixels per second
+        self.x_off: float = 0.0      # horizontal scroll offset in pixels
+        self.playhead: float = 0.0   # seconds
+
+        # drag state: None | ('playhead',) | ('xfade', i, orig_fade, orig_x)
+        self._drag = None
+
+        self.bind('<Configure>', lambda e: self.redraw())
+        self.bind('<ButtonPress-1>', self._on_press)
+        self.bind('<B1-Motion>', self._on_drag)
+        self.bind('<ButtonRelease-1>', self._on_release)
+        self.bind('<Double-Button-1>', self._on_dbl)
+        self.bind('<Button-3>', self._on_rclick)
+        self.bind('<Control-MouseWheel>', self._on_ctrl_wheel)
+        self.bind('<MouseWheel>', self._on_wheel)
+        self.bind('<Button-4>', lambda e: self._zoom(1.12, e.x))   # Linux scroll up
+        self.bind('<Button-5>', lambda e: self._zoom(1 / 1.12, e.x))
+
+    # ── coordinate helpers ────────────────────────────────────────────────────
+
+    def _px(self, sec: float) -> float:
+        return sec * self.pps - self.x_off
+
+    def _sec(self, px: float) -> float:
+        return (px + self.x_off) / self.pps
+
+    def _track_starts(self) -> list:
+        starts, t = [], 0.0
+        for i, tr in enumerate(self.tracks):
+            starts.append(t)
+            fade = self.transitions[i] if i < len(self.transitions) else 0.0
+            t += tr.seg_dur - (fade if i < len(self.tracks) - 1 else 0.0)
+        return starts
+
+    def _total_dur(self) -> float:
+        if not self.tracks:
+            return 0.0
+        starts = self._track_starts()
+        return starts[-1] + self.tracks[-1].seg_dur
+
+    def _hit_xfade(self, x: float, y: float):
+        """Return index of crossfade marker that (x,y) hits, or None."""
+        starts = self._track_starts()
+        for i in range(len(self.tracks) - 1):
+            fade = self.transitions[i] if i < len(self.transitions) else 0.0
+            if fade <= 0:
+                continue
+            xfade_x = self._px(starts[i] + self.tracks[i].seg_dur - fade)
+            row_top = RULER_H + i * TRACK_H
+            row_bot = row_top + TRACK_H * 2
+            if abs(x - xfade_x) <= XFADE_HIT and row_top <= y <= row_bot:
+                return i
+        return None
+
+    def _track_at(self, x: float, y: float):
+        """Return (track_index, seg_offset_sec) or (None, None)."""
+        starts = self._track_starts()
+        ry = (y - RULER_H) / TRACK_H
+        if ry < 0:
+            return None, None
+        i = int(ry)
+        if i >= len(self.tracks):
+            return None, None
+        seg_sec = self._sec(x) - starts[i]
+        if 0 <= seg_sec <= self.tracks[i].seg_dur:
+            return i, seg_sec
+        return None, None
+
+    # ── event handlers ────────────────────────────────────────────────────────
+
+    def _on_press(self, e):
+        self.focus_set()
+        xf = self._hit_xfade(e.x, e.y)
+        if xf is not None:
+            orig = self.transitions[xf] if xf < len(self.transitions) else 0.0
+            self._drag = ('xfade', xf, orig, e.x)
+            self.config(cursor='sb_h_double_arrow')
+            return
+        # Otherwise: move playhead
+        self._drag = ('playhead',)
+        self.config(cursor='crosshair')
+        sec = clamp(self._sec(e.x), 0.0, max(0.0, self._total_dur()))
+        self.playhead = sec
+        self.app.on_playhead_seek(sec)
+        self.redraw()
+
+    def _on_drag(self, e):
+        if self._drag is None:
+            return
+        if self._drag[0] == 'playhead':
+            sec = clamp(self._sec(e.x), 0.0, max(0.0, self._total_dur()))
+            self.playhead = sec
+            self.app.on_playhead_seek(sec)
+            self.redraw()
+        elif self._drag[0] == 'xfade':
+            _, i, orig_fade, orig_x = self._drag
+            # dragging left increases fade, right decreases
+            delta = (orig_x - e.x) / self.pps
+            tr_a = self.tracks[i]
+            tr_b = self.tracks[i + 1]
+            max_fade = min(0.45 * tr_a.seg_dur, 0.45 * tr_b.seg_dur, 30.0)
+            new_fade = clamp(orig_fade + delta, 0.0, max(0.0, max_fade))
+            if i < len(self.transitions):
+                self.transitions[i] = new_fade
+            self.app.on_transition_drag(i, new_fade)
+            self.redraw()
+
+    def _on_release(self, e):
+        self._drag = None
+        self.config(cursor='')
+
+    def _on_dbl(self, e):
+        i, seg_sec = self._track_at(e.x, e.y)
+        if i is not None:
+            self.app.split_track(i, seg_sec)
+
+    def _on_rclick(self, e):
+        i, seg_sec = self._track_at(e.x, e.y)
+        xf = self._hit_xfade(e.x, e.y)
+        menu = tk.Menu(self, tearoff=0, bg='#1a2030', fg=TEXT_COL,
+                       activebackground=SEL_COL, activeforeground='white',
+                       bd=0, relief='flat')
+        if xf is not None:
+            menu.add_command(
+                label=f'⏱  Set transition {xf + 1}→{xf + 2} duration…',
+                command=lambda: self.app.prompt_fade(xf),
+            )
+            menu.add_separator()
+        if i is not None:
+            menu.add_command(
+                label=f'✂  Split track {i + 1} here',
+                command=lambda: self.app.split_track(i, seg_sec),
+            )
+            menu.add_command(
+                label=f'◀  Trim start of track {i + 1} here',
+                command=lambda: self.app.trim_track(i, seg_sec, 'start'),
+            )
+            menu.add_command(
+                label=f'▶  Trim end of track {i + 1} here',
+                command=lambda: self.app.trim_track(i, seg_sec, 'end'),
+            )
+            menu.add_separator()
+            menu.add_command(
+                label=f'✕  Remove track {i + 1}',
+                command=lambda: self.app.remove_track(i),
+            )
+        if menu.index('end') is not None:
+            menu.post(e.x_root, e.y_root)
+
+    def _on_ctrl_wheel(self, e):
+        factor = 1.15 if e.delta > 0 else (1 / 1.15)
+        self._zoom(factor, e.x)
+
+    def _on_wheel(self, e):
+        self._scroll(-60 if e.delta > 0 else 60)
+
+    # ── scroll / zoom ─────────────────────────────────────────────────────────
+
+    def _scroll(self, dpx: float):
+        total_px = self._total_dur() * self.pps
+        w = self.winfo_width()
+        self.x_off = clamp(self.x_off + dpx, 0.0, max(0.0, total_px - w + 100))
+        self._update_sb()
+        self.redraw()
+
+    def _zoom(self, factor: float, cx: float = None):
+        if cx is None:
+            cx = self.winfo_width() / 2
+        sec_at = self._sec(cx)
+        self.pps = clamp(self.pps * factor, MIN_PPS, MAX_PPS)
+        self.x_off = max(0.0, sec_at * self.pps - cx)
+        self._update_sb()
+        self.redraw()
+
+    def zoom_in(self):
+        self._zoom(1.2)
+
+    def zoom_out(self):
+        self._zoom(1 / 1.2)
+
+    def _update_sb(self):
+        total_px = max(1.0, self._total_dur() * self.pps)
+        w = max(1, self.winfo_width())
+        lo = self.x_off / total_px
+        hi = (self.x_off + w) / total_px
+        self.hscroll.set(lo, min(1.0, hi))
+
+    def scroll_cmd(self, *args):
+        """Scrollbar command handler."""
+        total_px = max(1.0, self._total_dur() * self.pps)
+        if args[0] == 'moveto':
+            self.x_off = float(args[1]) * total_px
+        elif args[0] == 'scroll':
+            n, unit = int(args[1]), args[2]
+            dpx = n * (50 if unit == 'units' else self.winfo_width())
+            self.x_off += dpx
+        self.x_off = max(0.0, self.x_off)
+        self._update_sb()
+        self.redraw()
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def set_data(self, tracks: list, transitions: list):
         self.tracks = tracks
         self.transitions = transitions
-        self.total_duration = max(0.0, sum(t.duration for t in tracks) - sum(transitions))
+        self._update_sb()
         self.redraw()
 
     def set_playhead(self, sec: float):
-        self.playhead_sec = clamp(sec, 0.0, max(0.01, self.total_duration))
+        self.playhead = sec
+        # auto-scroll to keep playhead visible
+        px = self._px(sec)
+        w = self.winfo_width()
+        if px < 20 or px > w - 20:
+            self.x_off = max(0.0, sec * self.pps - w * 0.25)
         self.redraw()
 
-    def _on_wheel_zoom(self, e):
-        if e.delta > 0:
-            self._zoom(1.1)
-        else:
-            self._zoom(0.9)
-
-    def _zoom(self, factor: float):
-        self.pixels_per_sec = clamp(self.pixels_per_sec * factor, 20.0, 400.0)
-        self.redraw()
+    # ── drawing ───────────────────────────────────────────────────────────────
 
     def redraw(self):
-        self.delete("all")
-        w = max(10, self.winfo_width())
-        h = max(10, self.winfo_height())
+        self.delete('all')
+        cw = max(10, self.winfo_width())
+        ch = max(10, self.winfo_height())
 
-        # Draw timeline background grid
-        secs_visible = w / self.pixels_per_sec
-        tick = 5 if self.pixels_per_sec < 60 else 1
-        for s in range(0, int(secs_visible) + 2, tick):
-            x = int(s * self.pixels_per_sec)
-            self.create_line(x, 0, x, h, fill="#1d2328")
-            self.create_text(x + 4, 10, anchor="nw", fill="#6b7785", text=f"{s}s", font=("Segoe UI", 9))
+        # Time ruler background
+        self.create_rectangle(0, 0, cw, RULER_H, fill=RULER_BG, outline='')
 
-        # Nothing to draw
         if not self.tracks:
-            self.create_text(w//2, h//2, fill="#6b7785", text="Drop audio files here (or use Import…)", font=("Segoe UI", 14))
+            self.create_text(
+                cw // 2, ch // 2, fill=DIM_COL,
+                text='Drop audio files here  •  or click Import',
+                font=('Segoe UI', 14),
+            )
             return
 
-        # Layout per track row
-        row_h = max(60, (h - 40) // max(1, len(self.tracks)))
-        y0 = 30
+        starts = self._track_starts()
 
-        # Compute each track's start time in the mix timeline
-        starts = []
-        tcur = 0.0
+        # Grid lines + time labels
+        self._draw_ruler(cw, ch)
+
+        # Track rows
         for i, tr in enumerate(self.tracks):
-            starts.append(tcur)
-            if i < len(self.transitions):
-                tcur += tr.duration - self.transitions[i]
-            else:
-                tcur += tr.duration
+            self._draw_track(i, tr, starts[i], cw)
 
-        # Draw waveforms + transition markers
-        for i, tr in enumerate(self.tracks):
-            top = y0 + i * row_h
-            mid = top + row_h // 2
-            self.create_text(8, top + 4, anchor="nw", fill="#cbd5df",
-                             text=f"{i+1}. {Path(tr.path).name}  ({tr.duration:.1f}s)",
-                             font=("Segoe UI", 10, "bold"))
+        # Crossfade markers
+        for i in range(len(self.tracks) - 1):
+            self._draw_xfade(i, starts, cw)
 
-            # track rectangle
-            x_start = int(starts[i] * self.pixels_per_sec)
-            x_end = int((starts[i] + tr.duration) * self.pixels_per_sec)
-            self.create_rectangle(x_start, top + 18, x_end, top + row_h - 8, outline="#2a323a")
+        # Playhead (drawn last = on top)
+        phx = self._px(self.playhead)
+        if -2 <= phx <= cw + 2:
+            self.create_line(phx, 0, phx, ch, fill=PH_COL, width=2)
+            self.create_polygon(
+                phx - 7, 0, phx + 7, 0, phx, 14,
+                fill=PH_COL, outline='',
+            )
 
-            # waveform
+    def _draw_ruler(self, cw: int, ch: int):
+        tick = self._nice_interval()
+        t = 0.0
+        while True:
+            x = self._px(t)
+            if x > cw:
+                break
+            if x >= 0:
+                self.create_line(x, RULER_H - 6, x, ch, fill=GRID_COL)
+                self.create_line(x, RULER_H - 6, x, RULER_H, fill='#3a4550')
+                self.create_text(
+                    x + 3, 5, anchor='nw', fill='#6b7785',
+                    text=fmt_time(t), font=('Segoe UI', 8),
+                )
+            t = round(t + tick, 6)
+
+    def _nice_interval(self) -> float:
+        candidates = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600]
+        for c in candidates:
+            if c * self.pps >= 70:
+                return c
+        return candidates[-1]
+
+    def _draw_track(self, i: int, tr, start_sec: float, cw: int):
+        top = RULER_H + i * TRACK_H
+        bot = top + TRACK_H
+        mid = (top + bot) // 2
+
+        x0 = self._px(start_sec)
+        x1 = self._px(start_sec + tr.seg_dur)
+        cx0 = max(0, int(x0))
+        cx1 = min(cw, int(x1) + 1)
+        if cx1 <= cx0:
+            return
+
+        # Track background
+        self.create_rectangle(cx0, top + 2, cx1, bot - 2, fill=TRACK_BG, outline=TRACK_BOR)
+
+        # Track label
+        name = Path(tr.path).name
+        extras = []
+        if tr.bpm:
+            extras.append(f'{tr.bpm:.0f} BPM')
+        if tr.key:
+            extras.append(tr.key)
+        label = name + ('  ' + '  '.join(extras) if extras else '')
+        self.create_text(
+            cx0 + 8, top + 8, anchor='nw', fill=TEXT_COL,
+            text=label, font=('Segoe UI', 9, 'bold'),
+        )
+
+        # Duration label (right side)
+        dur_str = fmt_time(tr.seg_dur)
+        self.create_text(
+            cx1 - 6, bot - 8, anchor='se', fill=DIM_COL,
+            text=dur_str, font=('Segoe UI', 8),
+        )
+
+        # Waveform
+        if tr.waveform is not None and tr.waveform.size > 2:
+            wave_h = max(4, (TRACK_H - 32) // 2)
             wf = tr.waveform
-            if wf is not None and wf.size > 10:
-                # wf is normalized 0..1 abs envelope
-                usable_h = (row_h - 34) // 2
-                x0 = x_start
-                x1 = x_end
-                width = max(1, x1 - x0)
-                # sample wf to canvas width for this track
-                idx = np.linspace(0, wf.size - 1, num=width, dtype=np.int32)
-                vals = wf[idx]
-                for px in range(width):
-                    amp = int(vals[px] * usable_h)
-                    self.create_line(x0 + px, mid - amp, x0 + px, mid + amp, fill="#3aa7ff")
+            vis_x0 = max(0, int(x0))
+            vis_x1 = min(cw, int(x1) + 1)
+            width_px = max(1, x1 - x0)
 
-            # transition marker (between i and i+1)
-            if i < len(self.transitions):
-                fade = self.transitions[i]
-                fade_start = starts[i] + (tr.duration - fade)
-                x = int(fade_start * self.pixels_per_sec)
-                self.create_line(x, top + 18, x, top + row_h - 8, fill="#ffb020", width=2)
-                self.create_text(x + 4, top + 20, anchor="nw", fill="#ffb020",
-                                 text=f"xfade {fade:.1f}s", font=("Segoe UI", 9, "bold"))
+            top_pts = []
+            bot_pts = []
+            step = max(1, (vis_x1 - vis_x0) // 1500)  # limit point count for speed
+            for px in range(vis_x0, vis_x1, step):
+                frac = clamp((px - x0) / width_px, 0.0, 1.0)
+                wf_i = int(frac * (wf.size - 1))
+                amp = int(wf[wf_i] * wave_h)
+                top_pts += [px, mid - amp]
+                bot_pts += [px, mid + amp]
 
-        # Playhead
-        phx = int(self.playhead_sec * self.pixels_per_sec)
-        self.create_line(phx, 0, phx, h, fill="#ff4d4d", width=2)
-        self.create_text(phx + 6, 2, anchor="nw", fill="#ff4d4d", text="▶", font=("Segoe UI", 14, "bold"))
+            if len(top_pts) >= 4:
+                all_pts = top_pts + list(reversed(bot_pts))
+                self.create_polygon(all_pts, fill=WAVE_FILL, outline='')
+                self.create_line(top_pts, fill=WAVE_LINE, width=1)
+                self.create_line(bot_pts, fill=WAVE_LINE, width=1)
+
+        # Trim handles
+        if cx0 >= 0:
+            self.create_rectangle(cx0, top + 2, cx0 + 5, bot - 2, fill='#50c050', outline='')
+        if cx1 <= cw:
+            self.create_rectangle(cx1 - 5, top + 2, cx1, bot - 2, fill='#50c050', outline='')
+
+        # Track number badge
+        self.create_text(
+            cx0 + 8, bot - 8, anchor='sw', fill=DIM_COL,
+            text=f'#{i + 1}', font=('Segoe UI', 8),
+        )
+
+    def _draw_xfade(self, i: int, starts: list, cw: int):
+        fade = self.transitions[i] if i < len(self.transitions) else 0.0
+        if fade < 0.05:
+            return
+
+        tr_a = self.tracks[i]
+        xfade_sec = starts[i] + tr_a.seg_dur - fade
+        x_start = self._px(xfade_sec)
+        x_end = self._px(xfade_sec + fade)
+
+        row_top_a = RULER_H + i * TRACK_H
+        row_top_b = row_top_a + TRACK_H
+
+        # Shaded zone on track A (fade out region)
+        cx0 = max(0, int(x_start))
+        cx1 = min(cw, int(x_end) + 1)
+        if cx1 > cx0:
+            self.create_rectangle(
+                cx0, row_top_a + 2, cx1, row_top_a + TRACK_H - 2,
+                fill=XFADE_BG, outline='',
+            )
+            # Shaded zone on track B (fade in region)
+            if i + 1 < len(self.tracks):
+                self.create_rectangle(
+                    cx0, row_top_b + 2, cx1, row_top_b + TRACK_H - 2,
+                    fill=XFADE_BG, outline='',
+                )
+
+        # Vertical orange marker line
+        if -XFADE_HIT <= x_start <= cw + XFADE_HIT:
+            self.create_line(
+                x_start, row_top_a, x_start, row_top_b + TRACK_H,
+                fill=XFADE_COL, width=2,
+            )
+            # Label
+            self.create_text(
+                x_start + 5, row_top_a + TRACK_H // 2,
+                anchor='w', fill=XFADE_COL,
+                text=f'↔ {fade:.1f}s',
+                font=('Segoe UI', 8, 'bold'),
+            )
+            # Drag hint dots
+            for dy in [-8, 0, 8]:
+                self.create_oval(
+                    x_start - 3, row_top_a + TRACK_H // 2 + dy - 3,
+                    x_start + 3, row_top_a + TRACK_H // 2 + dy + 3,
+                    fill=XFADE_COL, outline='',
+                )
 
 
-class AppBase(tk.Tk):
-    pass
+# ─────────────────────────────────────────────────────────────────────────────
+# Application
+# ─────────────────────────────────────────────────────────────────────────────
 
+class App(TkinterDnD.Tk if DND_OK else tk.Tk):
 
-class AppDND(TkinterDnD.Tk):  # type: ignore
-    pass
-
-
-class App(AppDND if DND_OK else AppBase):
     def __init__(self):
         super().__init__()
-        self.title("DJ AutoMix — Tkinter Prototype")
-        self.geometry("1100x680")
-        self.minsize(980, 620)
+        self.title('DJ AutoMix')
+        self.geometry('1280x720')
+        self.minsize(900, 600)
+        self.configure(bg='#0e1014')
 
-        self.ffmpeg_path = tk.StringVar(value="ffmpeg")
-        self.ffplay_path = tk.StringVar(value="ffplay")
-        self.out_format = tk.StringVar(value="wav")
-        self.out_path = tk.StringVar(value=str(Path.cwd() / "mixes" / "mix.wav"))
-        self.status = tk.StringVar(value="Ready")
+        self.tracks: list = []
+        self.transitions: list = []
+        self.engine = AudioEngine()
+        self.engine.finished_cb = self._on_playback_finished
 
-        # Tracks and transitions
-        self.tracks: list[Track] = []
-        self.transitions: list[float] = []  # len = len(tracks)-1, per-boundary crossfade seconds
+        self.ffmpeg: str = 'ffmpeg'
 
-        # Playback
-        self.player = FFPlayer()
-        self.mix_preview_path: str | None = None
-        self._playhead_job = None
-        self._playhead_start_time = None
-        self._playhead_base = 0.0
+        # Playhead timer
+        self._ph_job = None
+        self._ph_start_wall: float = None
+        self._ph_base_sec: float = 0.0
+        self._ph_total: float = 0.0
 
-        self._ui()
+        self._build_ui()
 
         if DND_OK:
-            self._enable_dnd()
+            self._setup_dnd()
 
-    # ---------- UI ----------
-    def _ui(self):
-        root = ttk.Frame(self, padding=12)
-        root.pack(fill="both", expand=True)
+        # Keyboard shortcuts
+        self.bind('<space>', lambda e: self.toggle_play())
+        self.bind('<plus>', lambda e: self.timeline.zoom_in())
+        self.bind('<equal>', lambda e: self.timeline.zoom_in())  # = same key as +
+        self.bind('<minus>', lambda e: self.timeline.zoom_out())
+        self.bind('<Left>', lambda e: self._seek_rel(-5.0))
+        self.bind('<Right>', lambda e: self._seek_rel(5.0))
+        self.bind('<Home>', lambda e: self.set_playhead(0.0))
 
-        # Settings panel
-        settings = ttk.LabelFrame(root, text="Settings", padding=10)
-        settings.pack(fill="x")
+    # ── UI construction ───────────────────────────────────────────────────────
 
-        ttk.Label(settings, text="FFmpeg:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(settings, textvariable=self.ffmpeg_path, width=50).grid(row=0, column=1, padx=8, sticky="we")
-        ttk.Button(settings, text="Set…", command=self.pick_ffmpeg).grid(row=0, column=2, padx=(0, 6))
+    def _build_ui(self):
+        # ── Toolbar ──────────────────────────────────────────────────────────
+        tb = tk.Frame(self, bg='#161a20', pady=5, padx=8)
+        tb.pack(fill='x', side='top')
 
-        ttk.Label(settings, text="FFplay:").grid(row=0, column=3, sticky="w")
-        ttk.Entry(settings, textvariable=self.ffplay_path, width=35).grid(row=0, column=4, padx=8, sticky="we")
-        ttk.Button(settings, text="Set…", command=self.pick_ffplay).grid(row=0, column=5, padx=(0, 6))
+        def btn(parent, text, cmd, accent=False, width=None):
+            kw = dict(
+                text=text, command=cmd, relief='flat', padx=10, pady=5,
+                font=('Segoe UI', 9), activeforeground='white', cursor='hand2',
+            )
+            if accent:
+                kw.update(bg='#1e5fa0', fg='white', activebackground='#2a7ad0')
+            else:
+                kw.update(bg='#1e2535', fg=TEXT_COL, activebackground='#2a3545')
+            if width:
+                kw['width'] = width
+            b = tk.Button(parent, **kw)
+            b.pack(side='left', padx=3)
+            return b
 
-        ttk.Button(settings, text="Test FFmpeg", command=self.test_ffmpeg).grid(row=0, column=6, padx=(6, 0))
-        ttk.Button(settings, text="Test FFplay", command=self.test_ffplay).grid(row=0, column=7, padx=(6, 0))
+        def sep():
+            tk.Frame(tb, bg='#2a3545', width=1, height=26).pack(
+                side='left', padx=8, fill='y', pady=3,
+            )
 
-        ttk.Label(settings, text="Output format:").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        ttk.Combobox(
-            settings,
-            textvariable=self.out_format,
-            values=["wav", "mp3"],
-            state="readonly",
-            width=10,
-        ).grid(row=1, column=1, sticky="w", padx=8, pady=(10, 0))
+        btn(tb, '⊕  Import', self.import_tracks, accent=True)
+        sep()
+        self.btn_play = btn(tb, '▶  Play Mix', self.play_mix, accent=True)
+        btn(tb, '▶  Track', self.play_selected_track)
+        btn(tb, '■  Stop', self.stop_playback)
+        btn(tb, '⏮  Rewind', lambda: self.set_playhead(0.0))
+        sep()
+        btn(tb, '✦  Smart Transitions', self.smart_transitions)
+        btn(tb, '◀ Zoom ▶', None)   # placeholder label
+        btn(tb, '+', self.timeline_zoom_in_safe)
+        btn(tb, '−', self.timeline_zoom_out_safe)
+        sep()
+        btn(tb, '🚀  Export', self.export_mix, accent=True)
 
-        settings.columnconfigure(1, weight=1)
-        settings.columnconfigure(4, weight=1)
+        # Volume
+        tk.Label(tb, text='Volume', bg='#161a20', fg=DIM_COL,
+                 font=('Segoe UI', 8)).pack(side='left', padx=(14, 3))
+        self.vol_var = tk.DoubleVar(value=1.0)
+        tk.Scale(
+            tb, from_=0.0, to=1.0, resolution=0.01, orient='horizontal',
+            variable=self.vol_var, length=90, bg='#161a20', fg=TEXT_COL,
+            troughcolor='#2a3545', highlightthickness=0, showvalue=False,
+            command=lambda v: setattr(self.engine, 'volume', float(v)),
+        ).pack(side='left')
 
-        # Main layout
-        main = ttk.Frame(root)
-        main.pack(fill="both", expand=True, pady=(12, 0))
+        # Status label
+        self.status_var = tk.StringVar(value='Ready  —  DJ AutoMix')
+        tk.Label(
+            tb, textvariable=self.status_var, bg='#161a20', fg=DIM_COL,
+            font=('Segoe UI', 9),
+        ).pack(side='right', padx=12)
 
-        left = ttk.LabelFrame(main, text="Tracks", padding=10)
-        left.pack(side="left", fill="y")
+        # ── Main body ─────────────────────────────────────────────────────────
+        body = tk.PanedWindow(
+            self, orient='horizontal', bg='#0e1014',
+            sashwidth=5, sashrelief='flat', handlesize=0,
+        )
+        body.pack(fill='both', expand=True)
 
-        self.listbox = tk.Listbox(left, selectmode=tk.EXTENDED, width=45, height=18)
-        self.listbox.pack(fill="y", expand=False)
+        # Left sidebar
+        left = tk.Frame(body, bg='#0e1014', width=230)
+        body.add(left, minsize=190)
+        self._build_sidebar(left)
 
-        btns = ttk.Frame(left)
-        btns.pack(fill="x", pady=(8, 0))
+        # Right: timeline
+        right = tk.Frame(body, bg='#0e1014')
+        body.add(right, minsize=500)
+        self._build_timeline(right)
 
-        ttk.Button(btns, text="Import…", command=self.add_tracks).pack(side="left")
-        ttk.Button(btns, text="Remove", command=self.remove_selected).pack(side="left", padx=6)
-        ttk.Button(btns, text="Clear", command=self.clear_tracks).pack(side="left", padx=6)
+        # Log bar at bottom
+        self._build_log()
 
-        ttk.Button(btns, text="Up", command=lambda: self.move(-1)).pack(side="right")
-        ttk.Button(btns, text="Down", command=lambda: self.move(1)).pack(side="right", padx=6)
+    def _build_sidebar(self, parent):
+        # Track list
+        tk.Label(
+            parent, text='TRACKS', bg='#0e1014', fg=DIM_COL,
+            font=('Segoe UI', 8, 'bold'),
+        ).pack(anchor='w', padx=10, pady=(10, 2))
 
-        # Transition editor
-        trans_box = ttk.LabelFrame(left, text="Transitions (between tracks)", padding=10)
-        trans_box.pack(fill="x", pady=(10, 0))
-        self.trans_frame = ttk.Frame(trans_box)
-        self.trans_frame.pack(fill="x")
+        list_frame = tk.Frame(parent, bg='#0e1014')
+        list_frame.pack(fill='both', expand=True, padx=6)
 
-        ttk.Button(trans_box, text="Smart transitions (auto)", command=self.smart_transitions).pack(fill="x", pady=(8, 0))
+        sb = tk.Scrollbar(list_frame, bg='#1a2030', troughcolor='#0e1014',
+                          relief='flat', width=10)
+        self.listbox = tk.Listbox(
+            list_frame, bg='#141c28', fg=TEXT_COL,
+            selectbackground=SEL_COL, activestyle='none',
+            relief='flat', bd=0, font=('Segoe UI', 9),
+            yscrollcommand=sb.set, selectmode=tk.EXTENDED,
+        )
+        sb.config(command=self.listbox.yview)
+        sb.pack(side='right', fill='y')
+        self.listbox.pack(fill='both', expand=True)
+        self.listbox.bind('<Double-Button-1>', lambda e: self.play_selected_track())
 
-        # Right side: waveform + transport + export + log
-        right = ttk.Frame(main)
-        right.pack(side="right", fill="both", expand=True, padx=(12, 0))
+        # List action buttons
+        lb = tk.Frame(parent, bg='#0e1014')
+        lb.pack(fill='x', padx=6, pady=4)
+        for text, cmd in [
+            ('▲', lambda: self.move_track(-1)),
+            ('▼', lambda: self.move_track(1)),
+            ('✕', self.remove_selected),
+        ]:
+            tk.Button(
+                lb, text=text, command=cmd, bg='#1a2230', fg=TEXT_COL,
+                relief='flat', padx=8, pady=3, font=('Segoe UI', 9),
+                activebackground='#2a3240', activeforeground='white',
+                cursor='hand2',
+            ).pack(side='left', padx=2)
 
-        transport = ttk.LabelFrame(right, text="Transport", padding=10)
-        transport.pack(fill="x")
+        # Transitions panel
+        tk.Frame(parent, bg='#2a3545', height=1).pack(fill='x', padx=6, pady=8)
+        tk.Label(
+            parent, text='TRANSITIONS', bg='#0e1014', fg=DIM_COL,
+            font=('Segoe UI', 8, 'bold'),
+        ).pack(anchor='w', padx=10, pady=(0, 4))
 
-        ttk.Button(transport, text="▶ Play mix preview", command=self.play_mix_preview).pack(side="left")
-        ttk.Button(transport, text="■ Stop", command=self.stop_playback).pack(side="left", padx=8)
+        trans_scroll_frame = tk.Frame(parent, bg='#0e1014')
+        trans_scroll_frame.pack(fill='x', padx=6)
 
-        ttk.Button(transport, text="▶ Play selected track", command=self.play_selected_track).pack(side="left", padx=18)
+        self.trans_canvas = tk.Canvas(
+            trans_scroll_frame, bg='#0e1014', highlightthickness=0, height=180,
+        )
+        trans_sb = tk.Scrollbar(
+            trans_scroll_frame, orient='vertical', command=self.trans_canvas.yview,
+            bg='#1a2030', troughcolor='#0e1014', relief='flat', width=8,
+        )
+        self.trans_canvas.config(yscrollcommand=trans_sb.set)
+        trans_sb.pack(side='right', fill='y')
+        self.trans_canvas.pack(fill='x', expand=False)
 
-        ttk.Label(transport, text="Zoom: mouse wheel").pack(side="right")
+        self.trans_inner = tk.Frame(self.trans_canvas, bg='#0e1014')
+        self.trans_canvas.create_window((0, 0), window=self.trans_inner, anchor='nw')
+        self.trans_inner.bind(
+            '<Configure>',
+            lambda e: self.trans_canvas.config(
+                scrollregion=self.trans_canvas.bbox('all'),
+            ),
+        )
 
-        # Waveform view
-        self.wave = WaveformCanvas(right, height=320)
-        self.wave.pack(fill="both", expand=False, pady=(10, 0))
-        self.wave.bind("<Configure>", lambda e: self.wave.redraw())
+    def _build_timeline(self, parent):
+        hscroll = ttk.Scrollbar(parent, orient='horizontal')
+        hscroll.pack(side='bottom', fill='x')
 
-        # Export panel
-        export = ttk.LabelFrame(right, text="Export", padding=10)
-        export.pack(fill="x", pady=(10, 0))
+        self.timeline = TimelineCanvas(parent, app=self, hscroll=hscroll)
+        self.timeline.pack(fill='both', expand=True)
 
-        ttk.Entry(export, textvariable=self.out_path).pack(fill="x")
-        ttk.Button(export, text="Browse…", command=self.pick_output).pack(fill="x", pady=6)
-        ttk.Button(export, text="🚀 Export final mix", command=self.export_mix).pack(fill="x")
+        hscroll.config(command=self.timeline.scroll_cmd)
 
-        # Log
-        logbox = ttk.LabelFrame(right, text="Log", padding=10)
-        logbox.pack(fill="both", expand=True, pady=(10, 0))
+    def _build_log(self):
+        log_outer = tk.Frame(self, bg='#0c0e10', height=70)
+        log_outer.pack(fill='x', side='bottom')
+        log_outer.pack_propagate(False)
 
-        self.log = tk.Text(logbox, height=10, wrap="word")
-        self.log.pack(fill="both", expand=True)
+        tk.Label(
+            log_outer, text='LOG', bg='#0c0e10', fg='#2a3540',
+            font=('Segoe UI', 7, 'bold'),
+        ).pack(anchor='w', padx=6, pady=(2, 0))
 
-        ttk.Label(self, textvariable=self.status).pack(anchor="w", padx=12, pady=6)
+        self.log_text = tk.Text(
+            log_outer, bg='#0c0e10', fg='#3a5060',
+            font=('Consolas', 8), relief='flat', wrap='word', state='disabled',
+        )
+        self.log_text.pack(fill='both', expand=True, padx=6, pady=(0, 4))
 
-    def _enable_dnd(self):
-        # Make waveform accept drops
-        self.wave.drop_target_register(DND_FILES)
-        self.wave.dnd_bind("<<Drop>>", self._on_drop_files)
-
-        # Also allow drop on listbox
+    def _setup_dnd(self):
+        self.timeline.drop_target_register(DND_FILES)
+        self.timeline.dnd_bind('<<Drop>>', lambda e: self._add_paths(parse_dnd(e.data)))
         self.listbox.drop_target_register(DND_FILES)
-        self.listbox.dnd_bind("<<Drop>>", self._on_drop_files)
+        self.listbox.dnd_bind('<<Drop>>', lambda e: self._add_paths(parse_dnd(e.data)))
+        self.log('Drag & drop enabled.')
 
-        self.log_msg("Drag & drop enabled (tkinterdnd2).")
+    # Proxy methods called before timeline exists
+    def timeline_zoom_in_safe(self):
+        if hasattr(self, 'timeline'):
+            self.timeline.zoom_in()
 
-    # ---------- Helpers ----------
-    def log_msg(self, msg: str):
-        self.log.insert("end", msg + "\n")
-        self.log.see("end")
+    def timeline_zoom_out_safe(self):
+        if hasattr(self, 'timeline'):
+            self.timeline.zoom_out()
 
-    def _run(self, cmd: list[str], check=True) -> subprocess.CompletedProcess:
-        self.log_msg(">>> " + quote_cmd(cmd))
-        p = subprocess.run(cmd, capture_output=True, text=True)
-        if check and p.returncode != 0:
-            raise RuntimeError(p.stderr.strip() or p.stdout.strip() or f"Command failed: {p.returncode}")
-        return p
+    # ── logging ───────────────────────────────────────────────────────────────
 
-    def pick_ffmpeg(self):
-        p = filedialog.askopenfilename(title="Select ffmpeg")
-        if p:
-            self.ffmpeg_path.set(p)
-            self.log_msg(f"FFmpeg set: {p}")
+    def log(self, msg: str):
+        self.log_text.config(state='normal')
+        self.log_text.insert('end', msg + '\n')
+        self.log_text.see('end')
+        self.log_text.config(state='disabled')
 
-    def pick_ffplay(self):
-        p = filedialog.askopenfilename(title="Select ffplay")
-        if p:
-            self.ffplay_path.set(p)
-            self.log_msg(f"FFplay set: {p}")
+    def set_status(self, msg: str):
+        self.status_var.set(msg)
 
-    def test_ffmpeg(self):
-        try:
-            p = subprocess.run([self.ffmpeg_path.get(), "-version"], capture_output=True, text=True)
-            if p.returncode == 0:
-                messagebox.showinfo("FFmpeg", "FFmpeg OK")
-            else:
-                raise RuntimeError(p.stderr)
-        except Exception as e:
-            messagebox.showerror("FFmpeg", str(e))
+    # ── track management ──────────────────────────────────────────────────────
 
-    def test_ffplay(self):
-        try:
-            p = subprocess.run([self.ffplay_path.get(), "-version"], capture_output=True, text=True)
-            if p.returncode == 0:
-                messagebox.showinfo("FFplay", "FFplay OK")
-            else:
-                raise RuntimeError(p.stderr)
-        except Exception as e:
-            messagebox.showerror("FFplay", str(e))
-
-    # ---------- Drag & Drop ----------
-    def _on_drop_files(self, event):
-        paths = parse_dnd_files(event.data)
-        self._add_paths(paths)
-
-    # ---------- Tracks management ----------
-    def add_tracks(self):
+    def import_tracks(self):
         paths = filedialog.askopenfilenames(
-            title="Select audio files",
-            filetypes=[("Audio", "*.wav *.mp3 *.flac *.m4a *.ogg *.aac *.aif *.aiff")],
+            title='Select audio files',
+            filetypes=[('Audio files', '*.wav *.mp3 *.flac *.ogg *.m4a *.aac *.aif *.aiff')],
         )
         self._add_paths(list(paths))
 
-    def _add_paths(self, paths: list[str]):
-        good = []
-        for p in paths:
-            if not p:
-                continue
-            if p.lower().endswith(AUDIO_EXTS) and Path(p).exists():
-                good.append(p)
-
-        if not good:
+    def _add_paths(self, paths: list):
+        valid = [
+            p for p in paths
+            if p and Path(p).exists() and Path(p).suffix.lower() in AUDIO_EXTS
+        ]
+        if not valid:
             return
-
-        self.status.set("Importing… (probing files)")
-        self.log_msg(f"Adding {len(good)} file(s)…")
+        self.set_status(f'Loading {len(valid)} file(s)…')
+        self.log(f'Importing: {", ".join(Path(p).name for p in valid)}')
 
         def work():
-            try:
-                for p in good:
+            errors = []
+            for p in valid:
+                try:
                     tr = Track(path=p)
-                    self._probe_track(tr)
-                    tr.waveform = self._build_waveform(tr.path, seconds=60.0)  # display proxy
+                    tr.load(self.ffmpeg)
                     self.tracks.append(tr)
-                    self.listbox.insert("end", p)
-
-                # transitions default (smart)
-                self.smart_transitions(rebuild_only=True)
-
-                self._refresh_transition_ui()
-                self._refresh_wave()
-                self.status.set(f"Tracks: {len(self.tracks)}")
-            except Exception as e:
-                self.status.set("Failed")
-                messagebox.showerror("Import failed", str(e))
+                    self._auto_transition()
+                    self.after(0, self._refresh)
+                    # BPM / key in background
+                    threading.Thread(
+                        target=self._run_analysis, args=(tr,), daemon=True,
+                    ).start()
+                except Exception as ex:
+                    errors.append(f'{Path(p).name}: {ex}')
+                    self.log(f'ERROR: {ex}')
+            if errors:
+                self.after(0, lambda: messagebox.showerror(
+                    'Import errors', '\n'.join(errors),
+                ))
+            self.after(0, lambda: self.set_status(f'{len(self.tracks)} track(s) loaded'))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def remove_selected(self):
-        sel = list(self.listbox.curselection())
-        if not sel:
+    def _run_analysis(self, tr: Track):
+        tr.analyze()
+        self.after(0, self._refresh)
+
+    def _auto_transition(self):
+        """Compute a smart transition for the last pair of tracks."""
+        i = len(self.tracks) - 2
+        if i < 0:
             return
-        for i in reversed(sel):
-            self.listbox.delete(i)
-            del self.tracks[i]
+        while len(self.transitions) < len(self.tracks) - 1:
+            self.transitions.append(8.0)
+        tr_a = self.tracks[i]
+        tr_b = self.tracks[i + 1]
+        fade = self._smart_fade(tr_a, tr_b)
+        self.transitions[i] = fade
 
-        self.smart_transitions(rebuild_only=True)
-        self._refresh_transition_ui()
-        self._refresh_wave()
+    def _smart_fade(self, tr_a: Track, tr_b: Track) -> float:
+        e1 = self._tail_rms(tr_a)
+        e2 = self._head_rms(tr_b)
+        base = 4.0 + 10.0 * ((e1 + e2) / 2.0)
+        if e1 < e2:
+            base += 2.0
+        max_fade = min(20.0, 0.3 * tr_a.seg_dur, 0.3 * tr_b.seg_dur)
+        return round(clamp(base, 1.0, max(1.0, max_fade)), 1)
 
-    def clear_tracks(self):
-        self.stop_playback()
-        self.listbox.delete(0, "end")
-        self.tracks.clear()
-        self.transitions.clear()
-        self._refresh_transition_ui()
-        self._refresh_wave()
+    def _tail_rms(self, tr: Track, dur: float = 20.0) -> float:
+        seg = tr.get_segment()
+        n = int(dur * tr.sr)
+        chunk = seg[-n:] if seg.shape[0] >= n else seg
+        return float(np.sqrt(np.mean(chunk ** 2)) + 1e-9)
 
-    def move(self, direction: int):
+    def _head_rms(self, tr: Track, dur: float = 20.0) -> float:
+        seg = tr.get_segment()
+        n = int(dur * tr.sr)
+        chunk = seg[:n]
+        return float(np.sqrt(np.mean(chunk ** 2)) + 1e-9)
+
+    def remove_selected(self):
+        sel = sorted(self.listbox.curselection(), reverse=True)
+        for i in sel:
+            self._delete_track(i)
+        self._refresh()
+
+    def remove_track(self, i: int):
+        self._delete_track(i)
+        self._refresh()
+
+    def _delete_track(self, i: int):
+        del self.tracks[i]
+        if i < len(self.transitions):
+            del self.transitions[i]
+        self._fix_transitions_len()
+
+    def move_track(self, direction: int):
         sel = list(self.listbox.curselection())
-        if not sel or len(sel) != 1:
+        if len(sel) != 1:
             return
         i = sel[0]
         j = clamp(i + direction, 0, len(self.tracks) - 1)
         if i == j:
             return
-
-        # swap
         self.tracks[i], self.tracks[j] = self.tracks[j], self.tracks[i]
-
-        # update listbox
-        items = [self.listbox.get(k) for k in range(self.listbox.size())]
-        items[i], items[j] = items[j], items[i]
-        self.listbox.delete(0, "end")
-        for it in items:
-            self.listbox.insert("end", it)
-
-        self.listbox.selection_clear(0, "end")
+        self._refresh()
+        self.listbox.selection_clear(0, 'end')
         self.listbox.selection_set(j)
 
-        self.smart_transitions(rebuild_only=True)
-        self._refresh_transition_ui()
-        self._refresh_wave()
-
-    # ---------- Probing + waveform ----------
-    def _probe_track(self, tr: Track):
-        # Use ffprobe via ffmpeg -i parsing (portable without requiring ffprobe)
-        cmd = [self.ffmpeg_path.get(), "-hide_banner", "-i", tr.path]
-        p = subprocess.run(cmd, capture_output=True, text=True)
-        text = (p.stderr or "") + "\n" + (p.stdout or "")
-
-        # duration parse
-        dur = 0.0
-        for line in text.splitlines():
-            line = line.strip()
-            if line.startswith("Duration:"):
-                # Duration: 00:03:25.12, start: 0.000000, bitrate: 320 kb/s
-                try:
-                    t = line.split("Duration:")[1].split(",")[0].strip()
-                    hh, mm, ss = t.split(":")
-                    dur = int(hh) * 3600 + int(mm) * 60 + float(ss)
-                    break
-                except Exception:
-                    pass
-        tr.duration = dur if dur > 0 else 0.0
-
-        # Try to parse sample rate and channels roughly
-        sr = 44100
-        ch = 2
-        for line in text.splitlines():
-            if "Audio:" in line and "Hz" in line:
-                # ... 44100 Hz, stereo, ...
-                try:
-                    parts = line.split(",")
-                    for part in parts:
-                        part = part.strip()
-                        if part.endswith("Hz"):
-                            sr = int(part.replace("Hz", "").strip())
-                        if part in ("mono", "stereo"):
-                            ch = 1 if part == "mono" else 2
-                except Exception:
-                    pass
-        tr.sr = sr
-        tr.channels = ch
-
-        self.log_msg(f"Probed: {Path(tr.path).name}  duration={tr.duration:.2f}s  sr={tr.sr}  ch={tr.channels}")
-
-    def _build_waveform(self, path: str, seconds: float = 60.0) -> np.ndarray:
-        """
-        Create a downsampled absolute amplitude envelope for drawing.
-        We decode (up to `seconds`) into raw s16le mono and compute RMS window envelope.
-        """
-        # Decode the first N seconds (fast enough for UI)
-        # -ac 1 for mono, -f s16le for raw PCM
-        cmd = [
-            self.ffmpeg_path.get(), "-hide_banner", "-loglevel", "error",
-            "-i", path,
-            "-t", f"{seconds:.3f}",
-            "-vn",
-            "-ac", "1",
-            "-ar", "22050",
-            "-f", "s16le",
-            "pipe:1",
-        ]
-        p = subprocess.run(cmd, capture_output=True)
-        if p.returncode != 0 or not p.stdout:
-            return None
-
-        pcm = np.frombuffer(p.stdout, dtype=np.int16).astype(np.float32)
-        if pcm.size < 1000:
-            return None
-
-        # Envelope: RMS over windows
-        win = 1024
-        n = pcm.size // win
-        pcm = pcm[: n * win].reshape(n, win)
-        rms = np.sqrt(np.mean(pcm * pcm, axis=1))
-        rms = rms / (np.max(rms) + 1e-9)
-        return rms.astype(np.float32)
-
-    # ---------- Transition logic ----------
-    def smart_transitions(self, rebuild_only: bool = False):
-        """
-        Smart default transitions:
-        - Choose crossfade length per boundary based on end energy of track i and start energy of track i+1.
-        - If both are energetic -> longer fade; if quiet -> shorter fade.
-        - Clamp to safe bounds and not longer than 20% of either track duration.
-        """
-        if len(self.tracks) < 2:
-            self.transitions = []
-            self._refresh_transition_ui()
-            self._refresh_wave()
+    def split_track(self, idx: int, at_sec: float):
+        result = self.tracks[idx].split(at_sec)
+        if result is None:
             return
+        left, right = result
+        self.tracks[idx] = left
+        self.tracks.insert(idx + 1, right)
+        # keep transitions sensible
+        orig = self.transitions[idx] if idx < len(self.transitions) else 4.0
+        self.transitions[idx] = min(orig, 0.2 * left.seg_dur)
+        self.transitions.insert(idx + 1, min(orig, 0.2 * right.seg_dur))
+        self._fix_transitions_len()
+        self._refresh()
 
-        self.status.set("Computing smart transitions…")
+    def trim_track(self, idx: int, at_sec: float, which: str):
+        tr = self.tracks[idx]
+        abs_t = tr.trim_start + at_sec
+        if which == 'start':
+            tr.trim_start = clamp(abs_t, 0.0, tr.trim_end - 0.1)
+        else:
+            tr.trim_end = clamp(abs_t, tr.trim_start + 0.1, tr.duration)
+        tr._compute_waveform()
+        self._refresh()
 
-        def energy_tail(path: str, tail_sec: float = 25.0) -> float:
-            # RMS over last tail_sec seconds
-            cmd = [
-                self.ffmpeg_path.get(), "-hide_banner", "-loglevel", "error",
-                "-sseof", f"-{tail_sec:.3f}",
-                "-i", path,
-                "-vn",
-                "-ac", "1",
-                "-ar", "22050",
-                "-t", f"{tail_sec:.3f}",
-                "-f", "s16le",
-                "pipe:1",
-            ]
-            p = subprocess.run(cmd, capture_output=True)
-            if p.returncode != 0 or not p.stdout:
-                return 0.2
-            pcm = np.frombuffer(p.stdout, dtype=np.int16).astype(np.float32)
-            if pcm.size < 2000:
-                return 0.2
-            rms = float(np.sqrt(np.mean(pcm * pcm)) / 32768.0)
-            return clamp(rms, 0.0, 1.0)
+    def _fix_transitions_len(self):
+        target = max(0, len(self.tracks) - 1)
+        while len(self.transitions) < target:
+            self.transitions.append(8.0)
+        while len(self.transitions) > target:
+            self.transitions.pop()
 
-        def energy_head(path: str, head_sec: float = 25.0) -> float:
-            cmd = [
-                self.ffmpeg_path.get(), "-hide_banner", "-loglevel", "error",
-                "-i", path,
-                "-vn",
-                "-ac", "1",
-                "-ar", "22050",
-                "-t", f"{head_sec:.3f}",
-                "-f", "s16le",
-                "pipe:1",
-            ]
-            p = subprocess.run(cmd, capture_output=True)
-            if p.returncode != 0 or not p.stdout:
-                return 0.2
-            pcm = np.frombuffer(p.stdout, dtype=np.int16).astype(np.float32)
-            if pcm.size < 2000:
-                return 0.2
-            rms = float(np.sqrt(np.mean(pcm * pcm)) / 32768.0)
-            return clamp(rms, 0.0, 1.0)
+    # ── refresh UI ────────────────────────────────────────────────────────────
+
+    def _refresh(self):
+        self._rebuild_listbox()
+        self.timeline.set_data(self.tracks, self.transitions)
+        self._rebuild_trans_panel()
+
+    def _rebuild_listbox(self):
+        self.listbox.delete(0, 'end')
+        for i, tr in enumerate(self.tracks):
+            name = Path(tr.path).name
+            extras = []
+            if tr.bpm:
+                extras.append(f'{tr.bpm:.0f}bpm')
+            if tr.key:
+                extras.append(tr.key)
+            suffix = '  ' + '  '.join(extras) if extras else ''
+            self.listbox.insert('end', f'{i + 1}. {name}{suffix}')
+
+    def _rebuild_trans_panel(self):
+        for w in self.trans_inner.winfo_children():
+            w.destroy()
+        n = len(self.tracks)
+        if n < 2:
+            tk.Label(
+                self.trans_inner, text='Add 2+ tracks', bg='#0e1014', fg=DIM_COL,
+                font=('Segoe UI', 8),
+            ).pack(anchor='w')
+            return
+        for i in range(n - 1):
+            self._make_trans_row(i)
+
+    def _make_trans_row(self, i: int):
+        fade = self.transitions[i] if i < len(self.transitions) else 8.0
+        row = tk.Frame(self.trans_inner, bg='#0e1014')
+        row.pack(fill='x', pady=2)
+
+        tk.Label(
+            row, text=f'{i + 1}→{i + 2}', bg='#0e1014', fg=DIM_COL,
+            font=('Segoe UI', 8), width=5,
+        ).pack(side='left')
+
+        lbl = tk.Label(
+            row, text=f'{fade:.1f}s', bg='#0e1014', fg=XFADE_COL,
+            font=('Segoe UI', 8), width=5,
+        )
+        lbl.pack(side='right')
+
+        var = tk.DoubleVar(value=fade)
+
+        def on_change(v, idx=i, var_=var, lbl_=lbl):
+            val = float(var_.get())
+            if idx < len(self.transitions):
+                self.transitions[idx] = val
+            lbl_.config(text=f'{val:.1f}s')
+            self.timeline.set_data(self.tracks, self.transitions)
+
+        tk.Scale(
+            row, from_=0.0, to=30.0, resolution=0.5, orient='horizontal',
+            variable=var, command=on_change, bg='#0e1014', fg=TEXT_COL,
+            troughcolor='#1a2a3a', highlightthickness=0, showvalue=False,
+        ).pack(side='left', fill='x', expand=True, padx=4)
+
+    # ── playback ──────────────────────────────────────────────────────────────
+
+    def toggle_play(self):
+        if self.engine.is_playing:
+            self.stop_playback()
+        else:
+            self.play_mix()
+
+    def play_mix(self):
+        if not self.tracks:
+            messagebox.showwarning('Play', 'Import at least one track first.')
+            return
+        start = self.timeline.playhead
+        self.set_status('Building mix…')
+
+        def work():
+            try:
+                mix, sr = build_mix(self.tracks, self.transitions)
+                total = mix.shape[0] / sr
+                self.after(0, lambda: self._start_playback(mix, sr, start, total))
+            except Exception as ex:
+                self.after(0, lambda: messagebox.showerror('Playback error', str(ex)))
+                self.after(0, lambda: self.set_status('Error'))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _start_playback(self, mix, sr, start_sec, total):
+        self.engine.play(mix, sr, start_sec)
+        self._start_ph_timer(start_sec, total)
+        self.set_status('Playing mix…')
+        self.btn_play.config(text='▐▐  Pause Mix')
+
+    def play_selected_track(self):
+        sel = list(self.listbox.curselection())
+        if not sel:
+            messagebox.showinfo('Play track', 'Select a track in the list first.')
+            return
+        tr = self.tracks[sel[0]]
+        seg = tr.get_segment()
+        self.engine.play(seg, tr.sr)
+        self._start_ph_timer(0.0, tr.seg_dur)
+        self.set_status(f'Playing: {Path(tr.path).name}')
+
+    def stop_playback(self):
+        self.engine.stop()
+        self._stop_ph_timer()
+        self.set_status('Stopped')
+        self.btn_play.config(text='▶  Play Mix')
+
+    def _on_playback_finished(self):
+        self.after(0, lambda: [
+            self._stop_ph_timer(),
+            self.set_status('Finished'),
+            self.btn_play.config(text='▶  Play Mix'),
+        ])
+
+    def on_playhead_seek(self, sec: float):
+        if self.engine.is_playing:
+            self.engine.seek(sec)
+            self._ph_base_sec = sec
+            self._ph_start_wall = time.time()
+
+    def _seek_rel(self, delta: float):
+        cur = self.timeline.playhead
+        new = clamp(cur + delta, 0.0, max(0.0, self.timeline._total_dur()))
+        self.set_playhead(new)
+
+    def set_playhead(self, sec: float):
+        self.timeline.set_playhead(sec)
+        self.on_playhead_seek(sec)
+
+    def _start_ph_timer(self, base: float, total: float):
+        self._stop_ph_timer()
+        self._ph_base_sec = base
+        self._ph_start_wall = time.time()
+        self._ph_total = total
+
+        def tick():
+            if self._ph_start_wall is None:
+                return
+            t = time.time() - self._ph_start_wall + self._ph_base_sec
+            t = min(t, self._ph_total)
+            self.timeline.set_playhead(t)
+            if t < self._ph_total and self.engine.is_playing:
+                self._ph_job = self.after(40, tick)
+            else:
+                self._ph_job = None
+
+        tick()
+
+    def _stop_ph_timer(self):
+        if self._ph_job:
+            try:
+                self.after_cancel(self._ph_job)
+            except Exception:
+                pass
+        self._ph_job = None
+        self._ph_start_wall = None
+
+    # ── transitions ───────────────────────────────────────────────────────────
+
+    def on_transition_drag(self, idx: int, new_fade: float):
+        while len(self.transitions) <= idx:
+            self.transitions.append(8.0)
+        self.transitions[idx] = new_fade
+        self._rebuild_trans_panel()
+
+    def prompt_fade(self, idx: int):
+        cur = self.transitions[idx] if idx < len(self.transitions) else 8.0
+        val = simpledialog.askfloat(
+            'Crossfade Duration',
+            f'Transition {idx + 1} → {idx + 2}  (seconds):',
+            initialvalue=round(cur, 1),
+            minvalue=0.0,
+            maxvalue=30.0,
+            parent=self,
+        )
+        if val is not None:
+            self.transitions[idx] = round(val, 1)
+            self._refresh()
+
+    def smart_transitions(self):
+        if len(self.tracks) < 2:
+            messagebox.showinfo('Smart Transitions', 'Add at least 2 tracks first.')
+            return
+        self.set_status('Computing smart transitions…')
 
         def work():
             try:
                 new = []
                 for i in range(len(self.tracks) - 1):
-                    a = self.tracks[i]
-                    b = self.tracks[i + 1]
-
-                    # If we are only rebuilding list length (after remove/reorder), keep existing where possible
-                    if rebuild_only and i < len(self.transitions):
-                        new.append(self.transitions[i])
-                        continue
-
-                    e1 = energy_tail(a.path)
-                    e2 = energy_head(b.path)
-
-                    # map energies to a fade length
-                    # quiet -> short; loud -> longer
-                    base = 4.0 + 10.0 * ((e1 + e2) / 2.0)  # 4..14 sec typical
-                    # bonus if outgoing is quieter than incoming (classic DJ handover)
-                    if e1 < e2:
-                        base += 2.0
-
-                    # hard constraints
-                    max_allowed = min(20.0, 0.2 * a.duration if a.duration else 20.0, 0.2 * b.duration if b.duration else 20.0)
-                    fade = clamp(base, 2.0, max(2.0, max_allowed))
-                    new.append(float(fade))
-
+                    fade = self._smart_fade(self.tracks[i], self.tracks[i + 1])
+                    new.append(fade)
                 self.transitions = new
-                self.log_msg("Smart transitions set: " + ", ".join(f"{x:.1f}s" for x in self.transitions))
-                self._refresh_transition_ui()
-                self._refresh_wave()
-                self.status.set("Ready")
-            except Exception as e:
-                self.status.set("Failed")
-                messagebox.showerror("Smart transitions failed", str(e))
+                self.after(0, self._refresh)
+                self.after(0, lambda: self.set_status(
+                    'Smart transitions: ' + ', '.join(f'{x:.1f}s' for x in new),
+                ))
+                self.log('Smart transitions applied: ' + ', '.join(f'{x:.1f}s' for x in new))
+            except Exception as ex:
+                self.after(0, lambda: messagebox.showerror('Smart Transitions', str(ex)))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _refresh_transition_ui(self):
-        # clear
-        for child in self.trans_frame.winfo_children():
-            child.destroy()
-
-        if len(self.tracks) < 2:
-            ttk.Label(self.trans_frame, text="Add 2+ tracks to edit transitions.").pack(anchor="w")
-            return
-
-        # create per-boundary sliders
-        for i in range(len(self.tracks) - 1):
-            row = ttk.Frame(self.trans_frame)
-            row.pack(fill="x", pady=3)
-
-            name = f"{i+1}→{i+2}"
-            ttk.Label(row, text=name, width=6).pack(side="left")
-
-            var = tk.DoubleVar(value=self.transitions[i] if i < len(self.transitions) else 8.0)
-
-            def on_change(_v, idx=i, v=var):
-                self.transitions[idx] = float(v.get())
-                self._refresh_wave()
-
-            scale = ttk.Scale(row, from_=2, to=20, variable=var, orient="horizontal", command=on_change)
-            scale.pack(side="left", fill="x", expand=True, padx=6)
-
-            lbl = ttk.Label(row, text=f"{var.get():.1f}s", width=6)
-            lbl.pack(side="left")
-
-            def update_label(*_args, v=var, l=lbl):
-                l.config(text=f"{v.get():.1f}s")
-
-            var.trace_add("write", update_label)
-
-    def _refresh_wave(self):
-        self.wave.set_data(self.tracks, self.transitions)
-
-    # ---------- Playback ----------
-    def play_selected_track(self):
-        sel = list(self.listbox.curselection())
-        if len(sel) != 1:
-            messagebox.showinfo("Play track", "Select exactly one track in the list.")
-            return
-        idx = sel[0]
-        tr = self.tracks[idx]
-        self.status.set(f"Playing: {Path(tr.path).name}")
-        self.player.play_file(self.ffplay_path.get(), tr.path)
-
-    def stop_playback(self):
-        self.player.stop()
-        self.status.set("Stopped")
-        self._stop_playhead_timer()
-
-    def _stop_playhead_timer(self):
-        if self._playhead_job is not None:
-            try:
-                self.after_cancel(self._playhead_job)
-            except Exception:
-                pass
-        self._playhead_job = None
-        self._playhead_start_time = None
-        self._playhead_base = 0.0
-        self.wave.set_playhead(0.0)
-
-    def _start_playhead_timer(self, total_duration: float):
-        self._stop_playhead_timer()
-        self._playhead_start_time = time.time()
-        self._playhead_base = 0.0
-
-        def tick():
-            if self._playhead_start_time is None:
-                return
-            t = time.time() - self._playhead_start_time + self._playhead_base
-            self.wave.set_playhead(min(t, total_duration))
-            if t < total_duration and (self.player.proc and self.player.proc.poll() is None):
-                self._playhead_job = self.after(60, tick)
-            else:
-                self._playhead_job = None
-
-        tick()
-
-    def play_mix_preview(self):
-        if len(self.tracks) < 2:
-            messagebox.showwarning("Preview", "Add at least 2 tracks.")
-            return
-
-        self.status.set("Building preview…")
-
-        def work():
-            try:
-                tmpdir = Path(tempfile.gettempdir())
-                out = tmpdir / f"tk_automix_preview_{int(time.time())}.wav"
-                self._build_mix(str(out), preview=True)
-                self.mix_preview_path = str(out)
-                self.status.set("Playing mix preview…")
-                self.player.play_file(self.ffplay_path.get(), str(out))
-                self._start_playhead_timer(self.wave.total_duration)
-            except Exception as e:
-                self.status.set("Failed")
-                messagebox.showerror("Preview failed", str(e))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    # ---------- Export ----------
-    def pick_output(self):
-        fmt = self.out_format.get()
-        p = filedialog.asksaveasfilename(
-            defaultextension=f".{fmt}",
-            filetypes=[("Audio", f"*.{fmt}")],
-        )
-        if p:
-            self.out_path.set(p)
+    # ── export ────────────────────────────────────────────────────────────────
 
     def export_mix(self):
-        if len(self.tracks) < 2:
-            messagebox.showwarning("Export", "Add at least 2 tracks.")
+        if not self.tracks:
+            messagebox.showwarning('Export', 'No tracks to export.')
             return
-
-        out = Path(self.out_path.get())
-        out.parent.mkdir(parents=True, exist_ok=True)
+        out_path = filedialog.asksaveasfilename(
+            title='Save Mix As',
+            defaultextension='.wav',
+            filetypes=[
+                ('WAV audio', '*.wav'),
+                ('MP3 audio', '*.mp3'),
+            ],
+        )
+        if not out_path:
+            return
+        out = Path(out_path)
 
         def work():
             try:
-                self.status.set("Exporting…")
-                self._build_mix(str(out), preview=False)
-                self.status.set("Done")
-                messagebox.showinfo("Export", f"Saved:\n{out}")
-            except Exception as e:
-                self.status.set("Failed")
-                messagebox.showerror("Export failed", str(e))
+                self.after(0, lambda: self.set_status('Building mix for export…'))
+                mix, sr = build_mix(self.tracks, self.transitions)
+                if out.suffix.lower() == '.mp3':
+                    tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+                    sf.write(tmp.name, mix, sr)
+                    tmp.close()
+                    cmd = [
+                        self.ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+                        '-i', tmp.name,
+                        '-ar', '44100', '-ac', '2', '-b:a', '192k',
+                        str(out),
+                    ]
+                    subprocess.run(cmd, check=True)
+                    os.unlink(tmp.name)
+                else:
+                    sf.write(str(out), mix, sr)
+                self.after(0, lambda: self.set_status(f'Exported: {out.name}'))
+                self.after(0, lambda: messagebox.showinfo('Export Complete', f'Saved:\n{out}'))
+                self.log(f'Exported: {out}')
+            except Exception as ex:
+                self.after(0, lambda: messagebox.showerror('Export Failed', str(ex)))
+                self.after(0, lambda: self.set_status('Export failed'))
 
         threading.Thread(target=work, daemon=True).start()
 
-    # ---------- Mix building (FFmpeg) ----------
-    def _build_mix(self, out_path: str, preview: bool):
-        """
-        Build a full mix using iterative acrossfade, with per-boundary durations.
-        This is robust and simple.
-        """
-        tracks = [t.path for t in self.tracks]
-        fades = list(self.transitions)
+    # ── cleanup ───────────────────────────────────────────────────────────────
 
-        # Safety checks
-        if len(tracks) < 2:
-            raise ValueError("Need at least 2 tracks")
-        if len(fades) != len(tracks) - 1:
-            # fallback to 8 sec
-            fades = [8.0] * (len(tracks) - 1)
-
-        # Build filter_complex
-        # acrossfade expects both streams and produces a single output stream label.
-        parts = []
-        # First pair
-        parts.append(f"[0:a][1:a]acrossfade=d={fades[0]:.3f}:c1=tri:c2=tri[a01];")
-        # Remaining
-        for i in range(2, len(tracks)):
-            prev = "a01" if i == 2 else f"a0{i-1}"
-            cur = f"a0{i}"
-            parts.append(f"[{prev}][{i}:a]acrossfade=d={fades[i-1]:.3f}:c1=tri:c2=tri[{cur}];")
-
-        last = "a01" if len(tracks) == 2 else f"a0{len(tracks)-1}"
-        filt = "".join(parts)
-
-        cmd = [self.ffmpeg_path.get(), "-y"]
-        for t in tracks:
-            cmd += ["-i", t]
-        cmd += ["-filter_complex", filt, "-map", f"[{last}]"]
-
-        # Output codec params
-        fmt = Path(out_path).suffix.lower().lstrip(".")
-        if fmt == "mp3":
-            cmd += ["-ar", "44100", "-ac", "2", "-b:a", "192k"]
-        else:
-            cmd += ["-ar", "44100", "-ac", "2"]
-
-        # Preview can be shortened to first N seconds
-        if preview:
-            cmd += ["-t", "180"]  # 3 minutes preview cap (change if you want)
-
-        cmd += [out_path]
-
-        self._run(cmd, check=True)
-
-    # ---------- Exit ----------
     def destroy(self):
         try:
-            self.player.stop()
+            self.engine.stop()
         except Exception:
             pass
         super().destroy()
 
 
-if __name__ == "__main__":
-    App().mainloop()
+# ─────────────────────────────────────────────────────────────────────────────
+# Mix builder
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_mix(tracks: list, transitions: list) -> tuple:
+    """
+    Build the final mix as a float32 numpy array (N, 2).
+    Uses equal-power crossfades between tracks.
+    Returns (array, sample_rate).
+    """
+    if not tracks:
+        return np.zeros((0, 2), dtype=np.float32), 44100
+
+    sr = tracks[0].sr
+
+    # Collect segments, resampling to common sr if needed
+    segs = []
+    for tr in tracks:
+        seg = tr.get_segment()
+        if tr.sr != sr:
+            ratio = sr / tr.sr
+            n_out = int(seg.shape[0] * ratio)
+            x_in = np.linspace(0, seg.shape[0] - 1, n_out)
+            seg = np.stack(
+                [np.interp(x_in, np.arange(seg.shape[0]), seg[:, c]) for c in range(2)],
+                axis=1,
+            ).astype(np.float32)
+        segs.append(seg)
+
+    # Calculate total output samples
+    total = 0
+    for i, seg in enumerate(segs):
+        fade_samp = int(transitions[i] * sr) if i < len(transitions) else 0
+        if i < len(segs) - 1:
+            total += seg.shape[0] - fade_samp
+        else:
+            total += seg.shape[0]
+
+    out = np.zeros((total + sr, 2), dtype=np.float32)  # +1s safety buffer
+    cursor = 0
+
+    for i, seg in enumerate(segs):
+        # Fade-in from previous crossfade
+        if i > 0 and (i - 1) < len(transitions):
+            fade_samp = int(transitions[i - 1] * sr)
+        else:
+            fade_samp = 0
+
+        if fade_samp > 0 and cursor > 0:
+            fade_len = min(fade_samp, cursor, seg.shape[0])
+            # Equal-power crossfade curves
+            t = np.linspace(0.0, math.pi / 2, fade_len)
+            fade_out = np.cos(t)[:, np.newaxis]
+            fade_in = np.sin(t)[:, np.newaxis]
+
+            write_pos = cursor - fade_len
+            out[write_pos: cursor] *= fade_out
+            out[write_pos: cursor] += seg[:fade_len] * fade_in
+
+            rest = seg[fade_len:]
+            out[cursor: cursor + rest.shape[0]] = rest
+            cursor += rest.shape[0]
+        else:
+            end = cursor + seg.shape[0]
+            out[cursor: end] = seg
+            cursor = end
+
+    # Normalize to prevent clipping
+    mx = np.abs(out[:cursor]).max()
+    if mx > 0.98:
+        out[:cursor] *= 0.98 / mx
+
+    return out[:cursor], sr
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    app = App()
+    app.mainloop()
