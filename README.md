@@ -1,48 +1,91 @@
-# DJ AutoMix (Tkinter Prototype)
+DJ AutoMix
 
-# A simple desktop app to build audio mixes by combining tracks with automatic crossfades. It supports
+A Desktop Application for Automated Audio Mixing
 
-# importing audio files, preview playback, a basic waveform/timeline view, per-transition crossfade
+DJ AutoMix is a Python-based desktop application that allows users to quickly create smooth audio mixes using automatic crossfades.
+The application provides a simple graphical interface built with Tkinter and uses FFmpeg for audio processing.
 
-# control, and exporting the final mix using FFmpeg.
+This project is related to the thesis:
 
-# Requirements
+Design and Implementation of a Desktop Application for Automated Audio Mixing
+Dmitrii Evseev
 
-# • Python 3.10+
+🛠 Requirements
 
-# • FFmpeg installed (must include ffmpeg and ffplay in PATH, or set paths inside the app)
+Python 3.10+
 
-# Quick check (terminal):
+FFmpeg (must include ffmpeg and ffplay)
 
-# ffmpeg -version
+pip (Python package manager)
 
-# ffplay -version
+📦 Installation
+1️⃣ Install Python packages
+pip install numpy
+pip install tkinterdnd2   # optional (enables drag & drop)
+2️⃣ Install FFmpeg
 
-# Install
+Download FFmpeg and make sure ffmpeg and ffplay are available in your system PATH.
 
-# Install Python packages:
+Test it:
 
-# pip install numpy
+ffmpeg -version
+ffplay -version
 
-# pip install tkinterdnd2 (optional: enables drag \& drop)
+If not in PATH, you can manually set the path inside the application.
 
-# Run
+▶️ Running the Application
 
-# python version2\_dj\_automix\_tk.py
+From the project folder:
 
-# How to use
+python version2_dj_automix_tk.py
+🎧 How to Use
 
-# 1 Click Import… (or drag \& drop if enabled) to add audio files.
+Click Import… or drag & drop audio files.
 
-# 2 Adjust crossfades in Transitions (or click Smart transitions).
+Adjust transitions manually or click Smart transitions.
 
-# 3 Click Play mix preview to listen.
+Click Play mix preview to listen.
 
-# 4 Choose an output path in Export and click Export final mix.
+Choose export location.
 
-# Notes
+Click Export final mix.
 
-# • If drag \& drop does not work, install tkinterdnd2 (the app still works via Import).
+🧠 How It Works
 
-# • Export/preview speed depends on FFmpeg and your audio formats.
+The GUI is built using Tkinter
 
+Audio mixing is performed via FFmpeg filter_complex
+
+Crossfades are applied using FFmpeg's acrossfade
+
+Waveform visualization is generated using NumPy
+
+Playback is handled using ffplay
+
+⚠️ Notes
+
+If drag & drop does not work, install tkinterdnd2
+
+Performance depends on system speed and audio file size
+
+Large files may take longer to preview/export
+
+Currently optimized for single-user local mixing
+
+🚀 Future Improvements
+
+BPM detection and beat matching
+
+Key detection for harmonic mixing
+
+Timeline drag editing
+
+Multi-track volume automation
+
+Real-time scrubbing playback
+
+Multiple-user support
+
+📄 License
+
+This project is created for academic and educational purposes.
