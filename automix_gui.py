@@ -363,6 +363,11 @@ class TimelineCanvas(tk.Canvas):
         self.x_off: float = 0.0      # horizontal scroll offset in pixels
         self.playhead: float = 0.0   # seconds
 
+        # After the user scrolls/zooms, suppress auto-follow for this many seconds
+        self._user_scrolled_at: float = 0.0
+        _FOLLOW_COOLDOWN = 2.5       # seconds of inactivity before auto-follow resumes
+        self._follow_cooldown = _FOLLOW_COOLDOWN
+
         # drag state: None | ('playhead',) | ('xfade', i, orig_fade, orig_x)
         self._drag = None
 
@@ -518,6 +523,7 @@ class TimelineCanvas(tk.Canvas):
     # ── scroll / zoom ─────────────────────────────────────────────────────────
 
     def _scroll(self, dpx: float):
+        self._user_scrolled_at = time.time()
         total_px = self._total_dur() * self.pps
         w = self.winfo_width()
         self.x_off = clamp(self.x_off + dpx, 0.0, max(0.0, total_px - w + 100))
@@ -525,6 +531,7 @@ class TimelineCanvas(tk.Canvas):
         self.redraw()
 
     def _zoom(self, factor: float, cx: float = None):
+        self._user_scrolled_at = time.time()
         if cx is None:
             cx = self.winfo_width() / 2
         sec_at = self._sec(cx)
@@ -548,6 +555,7 @@ class TimelineCanvas(tk.Canvas):
 
     def scroll_cmd(self, *args):
         """Scrollbar command handler."""
+        self._user_scrolled_at = time.time()
         total_px = max(1.0, self._total_dur() * self.pps)
         if args[0] == 'moveto':
             self.x_off = float(args[1]) * total_px
@@ -569,11 +577,13 @@ class TimelineCanvas(tk.Canvas):
 
     def set_playhead(self, sec: float):
         self.playhead = sec
-        # auto-scroll to keep playhead visible
-        px = self._px(sec)
-        w = self.winfo_width()
-        if px < 20 or px > w - 20:
-            self.x_off = max(0.0, sec * self.pps - w * 0.25)
+        # Auto-follow the playhead only when the user hasn't recently scrolled/zoomed
+        user_idle = time.time() - self._user_scrolled_at > self._follow_cooldown
+        if user_idle:
+            px = self._px(sec)
+            w = self.winfo_width()
+            if px < 20 or px > w - 20:
+                self.x_off = max(0.0, sec * self.pps - w * 0.25)
         self.redraw()
 
     # ── drawing ───────────────────────────────────────────────────────────────
