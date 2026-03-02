@@ -64,8 +64,8 @@ AUDIO_EXTS = {'.wav', '.flac', '.ogg', '.aiff', '.aif', '.mp3', '.m4a', '.aac'}
 
 # Timeline layout constants
 RULER_H   = 28      # height of time ruler (pixels)
-TRACK_H   = 90      # height of each track row (pixels)
-MIN_PPS   = 8.0     # min pixels-per-second (zoomed out)
+TRACK_H   = 120     # height of each track row (pixels)
+MIN_PPS   = 1.0     # min pixels-per-second (zoomed out)
 MAX_PPS   = 600.0   # max pixels-per-second (zoomed in)
 XFADE_HIT = 12      # pixel radius for crossfade marker hit-test
 
@@ -528,24 +528,25 @@ class TimelineCanvas(tk.Canvas):
             if fade <= 0:
                 continue
             xfade_x = self._px(starts[i] + self.tracks[i].seg_dur - fade)
-            row_top = RULER_H + i * TRACK_H
-            row_bot = row_top + TRACK_H * 2
-            if abs(x - xfade_x) <= XFADE_HIT and row_top <= y <= row_bot:
+            if abs(x - xfade_x) <= XFADE_HIT and RULER_H <= y <= RULER_H + 2 * TRACK_H:
                 return i
         return None
 
     def _track_at(self, x: float, y: float):
         """Return (track_index, seg_offset_sec) or (None, None)."""
+        ry = y - RULER_H
+        if ry < 0 or ry > 2 * TRACK_H:
+            return None, None
+        row = 0 if ry < TRACK_H else 1
         starts = self._track_starts()
-        ry = (y - RULER_H) / TRACK_H
-        if ry < 0:
-            return None, None
-        i = int(ry)
-        if i >= len(self.tracks):
-            return None, None
-        seg_sec = self._sec(x) - starts[i]
-        if 0 <= seg_sec <= self.tracks[i].seg_dur:
-            return i, seg_sec
+        t_sec = self._sec(x)
+        for i, tr in enumerate(self.tracks):
+            if i % 2 != row:
+                continue
+            s = starts[i]
+            seg_sec = t_sec - s
+            if 0 <= seg_sec <= tr.seg_dur:
+                return i, seg_sec
         return None, None
 
     # ── event handlers ────────────────────────────────────────────────────────
@@ -662,6 +663,16 @@ class TimelineCanvas(tk.Canvas):
     def zoom_out(self):
         self._zoom(1 / 1.2)
 
+    def zoom_fit(self):
+        total = self._total_dur()
+        if total <= 0:
+            return
+        w = max(1, self.winfo_width())
+        self.pps = max(MIN_PPS, (w - 20) / total)
+        self.x_off = 0.0
+        self._update_sb()
+        self.redraw()
+
     def _update_sb(self):
         total_px = max(1.0, self._total_dur() * self.pps)
         w = max(1, self.winfo_width())
@@ -726,6 +737,10 @@ class TimelineCanvas(tk.Canvas):
         # Grid lines + time labels
         self._draw_ruler(cw, ch)
 
+        # Lane divider between the two rows
+        mid_y = RULER_H + TRACK_H
+        self.create_line(0, mid_y, cw, mid_y, fill='#1e2838', width=1)
+
         # Track rows
         for i, tr in enumerate(self.tracks):
             self._draw_track(i, tr, starts[i], cw)
@@ -767,7 +782,7 @@ class TimelineCanvas(tk.Canvas):
         return candidates[-1]
 
     def _draw_track(self, i: int, tr, start_sec: float, cw: int):
-        top = RULER_H + i * TRACK_H
+        top = RULER_H + (i % 2) * TRACK_H
         bot = top + TRACK_H
         mid = (top + bot) // 2
 
@@ -846,16 +861,20 @@ class TimelineCanvas(tk.Canvas):
         col   = trans_color(ttype)
         name  = trans_name(ttype)
 
-        # Hard Cut: just draw a thin line at the boundary, no shading
+        # Fixed lane boundaries (2-row layout)
+        lane_top = RULER_H
+        lane_mid = RULER_H + TRACK_H
+        lane_bot = RULER_H + 2 * TRACK_H
+
+        # Hard Cut: thin vertical line at track boundary
         if ttype == 'cut':
             tr_a = self.tracks[i]
             cut_sec = starts[i] + tr_a.seg_dur
             cx = self._px(cut_sec)
             if -XFADE_HIT <= cx <= cw + XFADE_HIT:
-                row_top = RULER_H + i * TRACK_H
-                self.create_line(cx, row_top, cx, row_top + TRACK_H * 2, fill=col, width=2)
+                self.create_line(cx, lane_top, cx, lane_bot, fill=col, width=2)
                 self.create_text(
-                    cx + 4, row_top + TRACK_H // 2,
+                    cx + 4, lane_mid,
                     anchor='w', fill=col, text=name,
                     font=('Segoe UI', 8, 'bold'),
                 )
@@ -870,31 +889,19 @@ class TimelineCanvas(tk.Canvas):
         x_start = self._px(xfade_sec)
         x_end   = self._px(xfade_sec + fade)
 
-        row_top_a = RULER_H + i * TRACK_H
-        row_top_b = row_top_a + TRACK_H
-
-        # Shaded zone (colour-tinted per type)
+        # Shaded zone spanning both lanes
         cx0 = max(0, int(x_start))
         cx1 = min(cw, int(x_end) + 1)
         if cx1 > cx0:
             self.create_rectangle(
-                cx0, row_top_a + 2, cx1, row_top_a + TRACK_H - 2,
+                cx0, lane_top + 2, cx1, lane_bot - 2,
                 fill=XFADE_BG, outline='',
             )
-            if i + 1 < len(self.tracks):
-                self.create_rectangle(
-                    cx0, row_top_b + 2, cx1, row_top_b + TRACK_H - 2,
-                    fill=XFADE_BG, outline='',
-                )
 
-        # Vertical marker line (type colour)
+        # Vertical marker line spanning both lanes
         if -XFADE_HIT <= x_start <= cw + XFADE_HIT:
-            self.create_line(
-                x_start, row_top_a, x_start, row_top_b + TRACK_H,
-                fill=col, width=2,
-            )
-            # Label: type name + duration
-            label_y = row_top_a + TRACK_H // 2
+            self.create_line(x_start, lane_top, x_start, lane_bot, fill=col, width=2)
+            label_y = lane_mid
             self.create_text(
                 x_start + 5, label_y - 8,
                 anchor='w', fill=col,
@@ -1013,6 +1020,7 @@ class App(TkinterDnD.Tk if DND_OK else tk.Tk):
         btn(tb, '◀ Zoom ▶', None, kind='zoom')
         btn(tb, '+', self.timeline_zoom_in_safe, kind='zoom', width=2)
         btn(tb, '−', self.timeline_zoom_out_safe, kind='zoom', width=2)
+        btn(tb, '⊡ Fit', self.timeline_zoom_fit_safe, kind='zoom')
         sep()
         btn(tb, '🚀  Export', self.export_mix, kind='export')
 
@@ -1165,6 +1173,10 @@ class App(TkinterDnD.Tk if DND_OK else tk.Tk):
     def timeline_zoom_out_safe(self):
         if hasattr(self, 'timeline'):
             self.timeline.zoom_out()
+
+    def timeline_zoom_fit_safe(self):
+        if hasattr(self, 'timeline'):
+            self.timeline.zoom_fit()
 
     # ── logging ───────────────────────────────────────────────────────────────
 
