@@ -180,6 +180,101 @@ def load_audio(path: str, ffmpeg: str = 'ffmpeg') -> tuple:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Custom widgets
+# ─────────────────────────────────────────────────────────────────────────────
+
+class VolumeSlider(tk.Canvas):
+    """Sleek custom volume slider with colored fill and hover thumb."""
+
+    _PAD   = 10   # horizontal padding
+    _TH    = 4    # track half-height
+    _TR    = 7    # thumb radius (normal)
+    _TR_H  = 9    # thumb radius (hover)
+
+    def __init__(self, parent, variable, command=None, length=110, bg='#161a20', **kw):
+        super().__init__(parent, width=length, height=26, bg=bg,
+                         highlightthickness=0, cursor='hand2', **kw)
+        self._var    = variable
+        self._cmd    = command
+        self._width  = length
+        self._bg     = bg
+        self._hover = False
+        self._drag  = False
+
+        variable.trace_add('write', lambda *_: self._draw())
+        self.bind('<ButtonPress-1>',   self._on_press)
+        self.bind('<B1-Motion>',       self._on_drag)
+        self.bind('<ButtonRelease-1>', self._on_release)
+        self.bind('<Enter>',  lambda e: self._set_hover(True))
+        self.bind('<Leave>',  lambda e: self._set_hover(False))
+        self._draw()
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def _val_to_x(self, val):
+        return self._PAD + val * (self._width - 2 * self._PAD)
+
+    def _x_to_val(self, x):
+        return max(0.0, min(1.0, (x - self._PAD) / (self._width - 2 * self._PAD)))
+
+    def _fill_color(self, val):
+        if val < 0.70:
+            return '#28a060'   # green
+        if val < 0.90:
+            return '#d0a020'   # amber
+        return '#d04828'       # red-orange (near max)
+
+    # ── drawing ───────────────────────────────────────────────────────────────
+    def _draw(self):
+        self.delete('all')
+        w, h = self._width, 26
+        cy   = h // 2
+        p    = self._PAD
+        th   = self._TH
+        val  = self._var.get()
+        fx   = self._val_to_x(val)
+
+        # Track groove background
+        self.create_rectangle(p, cy - th, w - p, cy + th,
+                               fill='#1a2538', outline='#0e1520', width=1)
+
+        # Coloured fill
+        if val > 0:
+            self.create_rectangle(p, cy - th, fx, cy + th,
+                                   fill=self._fill_color(val), outline='', width=0)
+
+        # Thumb
+        tr = self._TR_H if self._hover else self._TR
+        tc = '#dde8f4' if self._hover else '#b0bfd0'
+        self.create_oval(fx - tr, cy - tr, fx + tr, cy + tr,
+                          fill=tc, outline='#3a5878', width=1)
+        # Centre dot
+        self.create_oval(fx - 2, cy - 2, fx + 2, cy + 2,
+                          fill='#4a6888', outline='')
+
+    # ── events ────────────────────────────────────────────────────────────────
+    def _set_hover(self, state):
+        self._hover = state
+        self._draw()
+
+    def _update(self, x):
+        val = self._x_to_val(x)
+        self._var.set(round(val, 3))
+        if self._cmd:
+            self._cmd(val)
+
+    def _on_press(self, e):
+        self._drag = True
+        self._update(e.x)
+
+    def _on_drag(self, e):
+        if self._drag:
+            self._update(e.x)
+
+    def _on_release(self, e):
+        self._drag = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Track
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -869,50 +964,66 @@ class App(TkinterDnD.Tk if DND_OK else tk.Tk):
         tb = tk.Frame(self, bg='#161a20', pady=5, padx=8)
         tb.pack(fill='x', side='top')
 
-        def btn(parent, text, cmd, accent=False, width=None):
+        # ── per-kind colour triplets: (normal, hover, active/press) ─────────────
+        _BTN_COLS = {
+            'import':  ('#1a5fa8', '#2478cc', '#0e3f78', 'white'),
+            'play':    ('#1a6e3c', '#22904e', '#0f4a28', 'white'),
+            'track':   ('#145858', '#1a7272', '#0e3c3c', '#a0e8e8'),
+            'stop':    ('#7a2222', '#9e2c2c', '#581818', '#ffaaaa'),
+            'rewind':  ('#222a3a', '#2c3850', '#161e2e', TEXT_COL),
+            'action':  ('#2e1e52', '#3c2870', '#1e1238', '#c0a0ff'),
+            'zoom':    ('#1a2030', '#232d42', '#111826', DIM_COL),
+            'export':  ('#7a4010', '#9e5215', '#541c08', '#ffd090'),
+            'default': ('#1e2535', '#2a3545', '#141d2a', TEXT_COL),
+        }
+
+        def btn(parent, text, cmd, accent=False, width=None, kind='default'):
+            cols = _BTN_COLS.get(kind, _BTN_COLS['default'])
+            bg_n, bg_h, bg_p, fg = cols
             kw = dict(
-                text=text, command=cmd, relief='flat', padx=10, pady=5,
-                font=('Segoe UI', 9), activeforeground='white', cursor='hand2',
+                text=text, command=cmd, relief='flat',
+                padx=11, pady=6,
+                font=('Segoe UI', 9, 'bold') if kind in ('import', 'play', 'export') else ('Segoe UI', 9),
+                fg=fg, bg=bg_n,
+                activeforeground='white', activebackground=bg_p,
+                cursor='hand2', bd=0,
             )
-            if accent:
-                kw.update(bg='#1e5fa0', fg='white', activebackground='#2a7ad0')
-            else:
-                kw.update(bg='#1e2535', fg=TEXT_COL, activebackground='#2a3545')
             if width:
                 kw['width'] = width
             b = tk.Button(parent, **kw)
-            b.pack(side='left', padx=3)
+            b.pack(side='left', padx=2)
+            # Hover effects
+            b.bind('<Enter>', lambda e, w=b, c=bg_h: w.config(bg=c))
+            b.bind('<Leave>', lambda e, w=b, c=bg_n: w.config(bg=c))
             return b
 
         def sep():
-            tk.Frame(tb, bg='#2a3545', width=1, height=26).pack(
-                side='left', padx=8, fill='y', pady=3,
+            tk.Frame(tb, bg='#2a3a52', width=1, height=22).pack(
+                side='left', padx=8, fill='y', pady=4,
             )
 
-        btn(tb, '⊕  Import', self.import_tracks, accent=True)
+        btn(tb, '⊕  Import', self.import_tracks, kind='import')
         sep()
-        self.btn_play = btn(tb, '▶  Play Mix', self.play_mix, accent=True)
-        btn(tb, '▶  Track', self.play_selected_track)
-        btn(tb, '■  Stop', self.stop_playback)
-        btn(tb, '⏮  Rewind', lambda: self.set_playhead(0.0))
+        self.btn_play = btn(tb, '▶  Play Mix', self.play_mix, kind='play')
+        btn(tb, '▶  Track', self.play_selected_track, kind='track')
+        btn(tb, '■  Stop', self.stop_playback, kind='stop')
+        btn(tb, '⏮  Rewind', lambda: self.set_playhead(0.0), kind='rewind')
         sep()
-        btn(tb, '✦  Smart Transitions', self.smart_transitions)
-        btn(tb, '◀ Zoom ▶', None)   # placeholder label
-        btn(tb, '+', self.timeline_zoom_in_safe)
-        btn(tb, '−', self.timeline_zoom_out_safe)
+        btn(tb, '✦  Smart Transitions', self.smart_transitions, kind='action')
+        btn(tb, '◀ Zoom ▶', None, kind='zoom')
+        btn(tb, '+', self.timeline_zoom_in_safe, kind='zoom', width=2)
+        btn(tb, '−', self.timeline_zoom_out_safe, kind='zoom', width=2)
         sep()
-        btn(tb, '🚀  Export', self.export_mix, accent=True)
+        btn(tb, '🚀  Export', self.export_mix, kind='export')
 
         # Volume
-        tk.Label(tb, text='Volume', bg='#161a20', fg=DIM_COL,
-                 font=('Segoe UI', 8)).pack(side='left', padx=(14, 3))
+        tk.Label(tb, text='🔊', bg='#161a20', fg='#4a6888',
+                 font=('Segoe UI', 11)).pack(side='left', padx=(14, 2))
         self.vol_var = tk.DoubleVar(value=1.0)
-        tk.Scale(
-            tb, from_=0.0, to=1.0, resolution=0.01, orient='horizontal',
-            variable=self.vol_var, length=90, bg='#161a20', fg=TEXT_COL,
-            troughcolor='#2a3545', highlightthickness=0, showvalue=False,
+        VolumeSlider(
+            tb, variable=self.vol_var, length=110, bg='#161a20',
             command=lambda v: setattr(self.engine, 'volume', float(v)),
-        ).pack(side='left')
+        ).pack(side='left', pady=2)
 
         # Status label
         self.status_var = tk.StringVar(value='Ready  —  DJ AutoMix')
@@ -967,17 +1078,22 @@ class App(TkinterDnD.Tk if DND_OK else tk.Tk):
         # List action buttons
         lb = tk.Frame(parent, bg='#0e1014')
         lb.pack(fill='x', padx=6, pady=4)
-        for text, cmd in [
-            ('▲', lambda: self.move_track(-1)),
-            ('▼', lambda: self.move_track(1)),
-            ('✕', self.remove_selected),
-        ]:
-            tk.Button(
-                lb, text=text, command=cmd, bg='#1a2230', fg=TEXT_COL,
-                relief='flat', padx=8, pady=3, font=('Segoe UI', 9),
-                activebackground='#2a3240', activeforeground='white',
-                cursor='hand2',
-            ).pack(side='left', padx=2)
+        _list_btns = [
+            ('▲', lambda: self.move_track(-1), '#1a2a3a', '#243650', TEXT_COL),
+            ('▼', lambda: self.move_track(1),  '#1a2a3a', '#243650', TEXT_COL),
+            ('✕', self.remove_selected,         '#3a1818', '#582222', '#ffaaaa'),
+        ]
+        for text, cmd, bg_n, bg_h, fg in _list_btns:
+            b = tk.Button(
+                lb, text=text, command=cmd, bg=bg_n, fg=fg,
+                relief='flat', padx=9, pady=4,
+                font=('Segoe UI', 9),
+                activebackground=bg_h, activeforeground='white',
+                cursor='hand2', bd=0,
+            )
+            b.pack(side='left', padx=2)
+            b.bind('<Enter>', lambda e, w=b, c=bg_h: w.config(bg=c))
+            b.bind('<Leave>', lambda e, w=b, c=bg_n: w.config(bg=c))
 
         # Transitions panel
         tk.Frame(parent, bg='#2a3545', height=1).pack(fill='x', padx=6, pady=8)
