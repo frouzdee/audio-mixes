@@ -967,41 +967,41 @@ class App(TkinterDnD.Tk if DND_OK else tk.Tk):
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self):
+        # ── Preload toolbar icons ─────────────────────────────────────────────
+        _ui = Path(__file__).parent / 'ui'
+        def _img(name):
+            return tk.PhotoImage(file=str(_ui / name))
+        self._imgs = {
+            'import':             (_img('import.png'),             _img('importHover.png'),             _img('importPressed.png')),
+            'play':               (_img('play.png'),               _img('playHover.png'),               _img('playPressed.png')),
+            'stop':               (_img('stop.png'),               _img('stopHover.png'),               _img('stopPressed.png')),
+            'rewind':             (_img('rewind.png'),             _img('rewindHover.png'),             _img('rewindPressed.png')),
+            'smartTransitions':   (_img('smartTransitions.png'),   _img('smartTransitionsHover.png'),   _img('smartTransitionsPressed.png')),
+            'plus':               (_img('plus.png'),               _img('plusHover.png'),               _img('plusPressed.png')),
+            'minus':              (_img('minus.png'),              _img('minusHover.png'),              _img('minusPressed.png')),
+            'fit':                (_img('fit.png'),                _img('fitHover.png'),                _img('fitPressed.png')),
+            'export':             (_img('export.png'),             _img('exportHover.png'),             _img('exportPressed.png')),
+        }
+
         # ── Toolbar ──────────────────────────────────────────────────────────
         tb = tk.Frame(self, bg='#161a20', pady=5, padx=8)
         tb.pack(fill='x', side='top')
 
-        # ── per-kind colour triplets: (normal, hover, active/press) ─────────────
-        _BTN_COLS = {
-            'import':  ('#1a5fa8', '#2478cc', '#0e3f78', 'white'),
-            'play':    ('#1a6e3c', '#22904e', '#0f4a28', 'white'),
-            'track':   ('#145858', '#1a7272', '#0e3c3c', '#a0e8e8'),
-            'stop':    ('#7a2222', '#9e2c2c', '#581818', '#ffaaaa'),
-            'rewind':  ('#222a3a', '#2c3850', '#161e2e', TEXT_COL),
-            'action':  ('#2e1e52', '#3c2870', '#1e1238', '#c0a0ff'),
-            'zoom':    ('#1a2030', '#232d42', '#111826', DIM_COL),
-            'export':  ('#7a4010', '#9e5215', '#541c08', '#ffd090'),
-            'default': ('#1e2535', '#2a3545', '#141d2a', TEXT_COL),
-        }
+        _TB_BG = '#161a20'
 
-        def btn(parent, text, cmd, accent=False, width=None, kind='default'):
-            cols = _BTN_COLS.get(kind, _BTN_COLS['default'])
-            bg_n, bg_h, bg_p, fg = cols
-            kw = dict(
-                text=text, command=cmd, relief='flat',
-                padx=11, pady=6,
-                font=('Segoe UI', 9, 'bold') if kind in ('import', 'play', 'export') else ('Segoe UI', 9),
-                fg=fg, bg=bg_n,
-                activeforeground='white', activebackground=bg_p,
-                cursor='hand2', bd=0,
+        def img_btn(key, cmd):
+            img_n, img_h, img_p = self._imgs[key]
+            b = tk.Button(
+                tb, image=img_n, command=cmd,
+                relief='flat', padx=0, pady=0, bd=0,
+                bg=_TB_BG, activebackground=_TB_BG,
+                highlightthickness=0, cursor='hand2',
             )
-            if width:
-                kw['width'] = width
-            b = tk.Button(parent, **kw)
             b.pack(side='left', padx=2)
-            # Hover effects
-            b.bind('<Enter>', lambda e, w=b, c=bg_h: w.config(bg=c))
-            b.bind('<Leave>', lambda e, w=b, c=bg_n: w.config(bg=c))
+            b.bind('<Enter>',          lambda e, w=b: w.config(image=img_h))
+            b.bind('<Leave>',          lambda e, w=b: w.config(image=img_n))
+            b.bind('<ButtonPress-1>',  lambda e, w=b: w.config(image=img_p))
+            b.bind('<ButtonRelease-1>', lambda e, w=b: w.config(image=img_h))
             return b
 
         def sep():
@@ -1009,20 +1009,18 @@ class App(TkinterDnD.Tk if DND_OK else tk.Tk):
                 side='left', padx=8, fill='y', pady=4,
             )
 
-        btn(tb, '⊕  Import', self.import_tracks, kind='import')
+        img_btn('import', self.import_tracks)
         sep()
-        self.btn_play = btn(tb, '▶  Play Mix', self.play_mix, kind='play')
-        btn(tb, '▶  Track', self.play_selected_track, kind='track')
-        btn(tb, '■  Stop', self.stop_playback, kind='stop')
-        btn(tb, '⏮  Rewind', lambda: self.set_playhead(0.0), kind='rewind')
+        img_btn('play',   self.play_mix)
+        img_btn('stop',   self.stop_playback)
+        img_btn('rewind', lambda: self.set_playhead(0.0))
         sep()
-        btn(tb, '✦  Smart Transitions', self.smart_transitions, kind='action')
-        btn(tb, '◀ Zoom ▶', None, kind='zoom')
-        btn(tb, '+', self.timeline_zoom_in_safe, kind='zoom', width=2)
-        btn(tb, '−', self.timeline_zoom_out_safe, kind='zoom', width=2)
-        btn(tb, '⊡ Fit', self.timeline_zoom_fit_safe, kind='zoom')
+        img_btn('smartTransitions', self.smart_transitions)
+        img_btn('plus',  self.timeline_zoom_in_safe)
+        img_btn('minus', self.timeline_zoom_out_safe)
+        img_btn('fit',   self.timeline_zoom_fit_safe)
         sep()
-        btn(tb, '🚀  Export', self.export_mix, kind='export')
+        img_btn('export', self.export_mix)
 
         # Volume
         tk.Label(tb, text='🔊', bg='#161a20', fg='#4a6888',
@@ -1164,6 +1162,7 @@ class App(TkinterDnD.Tk if DND_OK else tk.Tk):
         self.listbox.drop_target_register(DND_FILES)
         self.listbox.dnd_bind('<<Drop>>', lambda e: self._add_paths(parse_dnd(e.data)))
         self.log('Drag & drop enabled.')
+
 
     # Proxy methods called before timeline exists
     def timeline_zoom_in_safe(self):
@@ -1500,7 +1499,6 @@ class App(TkinterDnD.Tk if DND_OK else tk.Tk):
         self.engine.play(mix, sr, start_sec)
         self._start_ph_timer(start_sec, total)
         self.set_status('Playing mix…')
-        self.btn_play.config(text='▐▐  Pause Mix')
 
     def play_selected_track(self):
         sel = list(self.listbox.curselection())
@@ -1517,13 +1515,11 @@ class App(TkinterDnD.Tk if DND_OK else tk.Tk):
         self.engine.stop()
         self._stop_ph_timer()
         self.set_status('Stopped')
-        self.btn_play.config(text='▶  Play Mix')
 
     def _on_playback_finished(self):
         self.after(0, lambda: [
             self._stop_ph_timer(),
             self.set_status('Finished'),
-            self.btn_play.config(text='▶  Play Mix'),
         ])
 
     def on_playhead_seek(self, sec: float):
